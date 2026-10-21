@@ -20,6 +20,13 @@ from app.pipeline.resolution import RelationTypeResolver
 logger = logging.getLogger(__name__)
 
 
+def _configure_logging() -> None:
+    # uvicorn configures only its own loggers; without this the app's INFO lines are dropped.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("app").setLevel(logging.INFO)
+
+
 def _default_llm_client(settings: Settings) -> LLMClient:
     if settings.openai_api_key is None:
         logger.warning("OPENAI_API_KEY is not set: uploads are disabled, read endpoints keep working")
@@ -52,6 +59,7 @@ def _register_error_handlers(app: FastAPI) -> None:
 
 
 def create_app(settings: Settings | None = None, llm_client: LLMClient | None = None) -> FastAPI:
+    _configure_logging()
     settings = settings or Settings()
 
     @asynccontextmanager
@@ -67,7 +75,9 @@ def create_app(settings: Settings | None = None, llm_client: LLMClient | None = 
             repository = GraphRepository(driver, settings.neo4j_database, settings.embedding_dimensions)
             await repository.init_schema()
             llm = llm_client or _default_llm_client(settings)
-            relation_types = RelationTypeResolver(repository, llm, match_score=settings.relation_type_match_score)
+            relation_types = RelationTypeResolver(
+                repository, llm, candidate_score=settings.relation_type_candidate_score
+            )
             app.state.services = Services(
                 settings=settings,
                 tokens=TokenService(settings),

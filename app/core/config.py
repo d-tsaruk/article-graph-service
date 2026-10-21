@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
     vision_model: str = "gpt-4o-mini"
+    judge_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = Field(default=1536, gt=0)
     llm_concurrency: int = Field(default=4, gt=0)
@@ -40,10 +41,9 @@ class Settings(BaseSettings):
     pdf_scanned_page_max_chars: int = Field(default=50, ge=0)
     pdf_drawings_render_threshold: int = Field(default=30, gt=0)
 
-    # Thresholds are on Neo4j's cosine score scale: score = (1 + cos) / 2.
-    character_match_score: float = Field(default=0.93, ge=0, le=1)
-    character_auto_merge_score: float = Field(default=0.97, ge=0, le=1)
-    relation_type_match_score: float = Field(default=0.95, ge=0, le=1)
+    character_candidate_limit: int = Field(default=10, gt=0)
+    # On Neo4j's cosine score scale: score = (1 + cos) / 2.
+    relation_type_candidate_score: float = Field(default=0.75, ge=0, le=1)
 
     @field_validator("openai_api_key", mode="before")
     @classmethod

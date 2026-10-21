@@ -19,18 +19,13 @@ def name_key(name: str) -> str:
     return " ".join(_NON_WORD.sub(" ", normalized).split())
 
 
-def _identifying_tokens(names: Iterable[str]) -> set[str]:
+def identifying_tokens(names: Iterable[str]) -> set[str]:
     return {
         token
         for name in names
         for token in name_key(name).split()
         if len(token) > 1 and token not in _NON_IDENTIFYING_TOKENS
     }
-
-
-def names_compatible(left: Iterable[str], right: Iterable[str]) -> bool:
-    """Guards vector-based merges: two name sets must share at least one identifying token."""
-    return bool(_identifying_tokens(left) & _identifying_tokens(right))
 
 
 def normalize_relation_type(raw: str) -> str:

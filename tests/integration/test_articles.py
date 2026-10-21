@@ -2,6 +2,7 @@ import neo4j
 from fastapi.testclient import TestClient
 
 from app.llm.schemas import ImageAnalysis
+from app.llm.vocabulary import CANONICAL_RELATION_TYPES
 from tests.factories import (
     HARRY_DESCRIPTION,
     HERMIONE_DESCRIPTION,
@@ -54,7 +55,7 @@ def test_markdown_upload_persists_article_characters_and_relations(
     ]
 
     records, _, _ = db.execute_query("MATCH (t:RelationType) RETURN t.name AS name")
-    assert [r["name"] for r in records] == ["FRIEND_OF"]
+    assert {r["name"] for r in records} == set(CANONICAL_RELATION_TYPES)
 
 
 def test_markdown_file_upload(client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient) -> None:
@@ -134,6 +135,7 @@ def test_characters_are_deduplicated_across_articles_by_alias(
         [character("Harry", "The boy with the scar"), character("Ron", "Loyal friend")],
         [relation("Ron", "Harry", "FRIEND_OF")],
     )
+    fake_llm.same_characters = [{"Harry", "Harry Potter"}, {"Ron", "Ron Weasley"}]
 
     upload_markdown(client, auth_headers, text="Ron and Harry played chess.")
 
@@ -144,39 +146,38 @@ def test_characters_are_deduplicated_across_articles_by_alias(
     assert [(r["name"], r["articles"]) for r in records] == [("Harry Potter", 2), ("Ron Weasley", 2)]
 
 
-def test_characters_are_deduplicated_across_articles_by_vector_similarity(
+def test_characters_are_deduplicated_across_articles_via_judge(
     client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
 ) -> None:
     fake_llm.extraction = extraction([character("Harry Potter", HARRY_DESCRIPTION)])
     upload_markdown(client, auth_headers)
     fake_llm.extraction = extraction(
-        [character("Mr. Potter", HARRY_DESCRIPTION), character("Ronald Weasley", RON_DESCRIPTION)]
+        [character("The Boy Who Lived", HARRY_DESCRIPTION), character("Ronald Weasley", RON_DESCRIPTION)]
     )
+    fake_llm.same_characters = [{"Harry Potter", "The Boy Who Lived"}]
 
-    upload_markdown(client, auth_headers, text="Mr. Potter and Ronald Weasley.")
+    upload_markdown(client, auth_headers, text="The Boy Who Lived and Ronald Weasley.")
 
     records, _, _ = db.execute_query("MATCH (c:Character) RETURN c.name AS name, c.aliases AS aliases")
     by_name = {r["name"]: r["aliases"] for r in records}
     assert set(by_name) == {"Harry Potter", "Ronald Weasley"}
-    assert "Mr. Potter" in by_name["Harry Potter"]
+    assert "The Boy Who Lived" in by_name["Harry Potter"]
 
 
-def test_relation_types_are_deduplicated_by_vector_similarity(
+def test_extraction_receives_vocabulary_and_used_types(
     client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
 ) -> None:
-    fake_llm.embedding_overrides = {"friends with": "friend of"}
-    fake_llm.extraction = harry_and_ron()
-    upload_markdown(client, auth_headers)
+    db.execute_query("CREATE (:RelationType {name: 'ORPHAN_TYPE', embedding: $e})", e=[0.0] * 63 + [1.0])
     fake_llm.extraction = extraction(
-        [character("Harry Potter", HARRY_DESCRIPTION), character("Hermione Granger", HERMIONE_DESCRIPTION)],
-        [relation("Harry Potter", "Hermione Granger", "friends with")],
+        [character("Harry Potter", HARRY_DESCRIPTION), character("Ron Weasley", RON_DESCRIPTION)],
+        [relation("Harry Potter", "Ron Weasley", "IN_LOVE_WITH")],
     )
+    upload_markdown(client, auth_headers)
 
-    upload_markdown(client, auth_headers, text="Harry and Hermione.")
+    upload_markdown(client, auth_headers, text="Harry and Ron again.")
 
-    records, _, _ = db.execute_query("MATCH ()-[r:RELATED_TO]->() RETURN DISTINCT r.type AS type")
-    assert [r["type"] for r in records] == ["FRIEND_OF"]
-    assert fake_llm.extract_calls[1][1] == ["FRIEND_OF"]
+    assert fake_llm.extract_calls[1][1] == [*CANONICAL_RELATION_TYPES, "IN_LOVE_WITH"]
+    assert "ORPHAN_TYPE" not in fake_llm.extract_calls[1][1]
 
 
 def test_relations_with_unknown_characters_or_self_loops_are_dropped(

@@ -1,5 +1,7 @@
 """Schemas passed to the LLM as Structured Outputs. Strict mode requires every field to be required."""
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -36,3 +38,20 @@ class ImageAnalysis(BaseModel):
         description="False for decorative content: logos, ornaments, page backgrounds, blank or unreadable images"
     )
     description: str = Field(description="Factual description of the visual content and any text it contains")
+
+
+class Verdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item: str = Field(description="Reference of the new item being judged, e.g. N1")
+    reason: str = Field(description="One short sentence explaining the decision, written before deciding")
+    decision: Literal["stored", "same_as_new", "new"] = Field(
+        description="stored: same as a known item; same_as_new: same as another new item; new: neither"
+    )
+    match: str | None = Field(description="S reference for `stored`, N reference for `same_as_new`, null for `new`")
+
+
+class Judgement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    verdicts: list[Verdict] = Field(description="Exactly one verdict per new item")

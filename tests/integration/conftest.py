@@ -65,6 +65,8 @@ def settings(neo4j_connection: tuple[str, str, str]) -> Settings:
         neo4j_user=user,
         neo4j_password=password,
         embedding_dimensions=64,
+        # The fake embedding puts every `X of` phrase at 0.75 and has hash collisions at 64 dimensions.
+        relation_type_candidate_score=0.9,
     )
 
 

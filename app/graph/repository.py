@@ -209,14 +209,35 @@ class GraphRepository:
 
     # Characters
 
-    async def find_character_by_keys(self, keys: list[str]) -> CharacterRecord | None:
+    async def find_character_by_name_key(self, key: str) -> CharacterRecord | None:
         records = await self._read(
-            "MATCH (c:Character) WHERE c.name_key IN $keys OR any(k IN c.alias_keys WHERE k IN $keys) "
-            "WITH c ORDER BY CASE WHEN c.name_key IN $keys THEN 0 ELSE 1 END, c.created_at LIMIT 1 "
+            "MATCH (c:Character {name_key: $key}) WITH c ORDER BY c.created_at LIMIT 1 "
             f"RETURN c {_CHARACTER_PROJECTION} AS c",
-            keys=keys,
+            key=key,
         )
         return CharacterRecord.from_map(records[0]["c"]) if records else None
+
+    async def find_characters_by_keys(self, keys: list[str]) -> list[CharacterRecord]:
+        records = await self._read(
+            "MATCH (c:Character) WHERE c.name_key IN $keys OR any(k IN c.alias_keys WHERE k IN $keys) "
+            f"WITH c ORDER BY c.created_at RETURN c {_CHARACTER_PROJECTION} AS c",
+            keys=keys,
+        )
+        return [CharacterRecord.from_map(r["c"]) for r in records]
+
+    async def find_characters_by_tokens(self, tokens: list[str], limit: int) -> list[CharacterRecord]:
+        """Characters whose name or any alias shares a whole word with `tokens`."""
+        if not tokens:
+            return []
+        records = await self._read(
+            "MATCH (c:Character) "
+            "WHERE any(k IN [c.name_key] + coalesce(c.alias_keys, []) "
+            "  WHERE any(t IN split(k, ' ') WHERE t IN $tokens)) "
+            f"WITH c ORDER BY c.created_at LIMIT $limit RETURN c {_CHARACTER_PROJECTION} AS c",
+            tokens=tokens,
+            limit=limit,
+        )
+        return [CharacterRecord.from_map(r["c"]) for r in records]
 
     async def find_similar_characters(self, embedding: list[float], limit: int) -> list[CharacterMatch]:
         records = await self._read(
@@ -314,15 +335,9 @@ class GraphRepository:
 
     # Relation types
 
-    async def relation_type_exists(self, name: str) -> bool:
-        records = await self._read("MATCH (t:RelationType {name: $name}) RETURN count(t) > 0 AS found", name=name)
-        return records[0]["found"]
-
-    async def list_relation_type_names(self, limit: int) -> list[str]:
-        records = await self._read(
-            "MATCH (t:RelationType) RETURN t.name AS name ORDER BY name LIMIT $limit", limit=limit
-        )
-        return [r["name"] for r in records]
+    async def existing_relation_types(self, names: list[str]) -> set[str]:
+        records = await self._read("MATCH (t:RelationType) WHERE t.name IN $names RETURN t.name AS name", names=names)
+        return {r["name"] for r in records}
 
     async def find_similar_relation_types(self, embedding: list[float], limit: int) -> list[RelationTypeMatch]:
         records = await self._read(
@@ -334,9 +349,12 @@ class GraphRepository:
         )
         return [RelationTypeMatch(r["name"], r["score"]) for r in records]
 
-    async def create_relation_type(self, name: str, embedding: list[float]) -> None:
+    async def create_relation_types(self, items: list[tuple[str, list[float]]]) -> None:
+        if not items:
+            return
         await self._write(
-            "MERGE (t:RelationType {name: $name}) ON CREATE SET t.embedding = $embedding, t.created_at = datetime()",
-            name=name,
-            embedding=embedding,
+            "UNWIND $items AS item "
+            "MERGE (t:RelationType {name: item.name}) "
+            "ON CREATE SET t.embedding = item.embedding, t.created_at = datetime()",
+            items=[{"name": name, "embedding": embedding} for name, embedding in items],
         )

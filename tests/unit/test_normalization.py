@@ -1,6 +1,6 @@
 import pytest
 
-from app.pipeline.normalization import name_key, names_compatible, normalize_relation_type, relation_type_phrase
+from app.pipeline.normalization import identifying_tokens, name_key, normalize_relation_type, relation_type_phrase
 
 
 @pytest.mark.parametrize(
@@ -40,16 +40,13 @@ def test_relation_type_phrase() -> None:
 
 
 @pytest.mark.parametrize(
-    ("left", "right", "expected"),
+    ("names", "expected"),
     [
-        (["Harry Potter"], ["Harry"], True),
-        (["Mr. Dursley"], ["Vernon Dursley"], True),
-        (["Professor Dumbledore"], ["Albus Dumbledore"], True),
-        (["Harry Potter"], ["Ron Weasley"], False),
-        (["Mr. Smith"], ["Mrs. Jones"], False),
-        (["Mr."], ["Mr."], False),
-        (["The Dark Lord"], ["Voldemort", "Dark Lord"], True),
+        (["Mr. Dursley"], {"dursley"}),
+        (["Harry Potter", "Harry"], {"harry", "potter"}),
+        (["Mr."], set()),
+        (["The Dark Lord"], {"dark"}),
     ],
 )
-def test_names_compatible(left: list[str], right: list[str], expected: bool) -> None:
-    assert names_compatible(left, right) is expected
+def test_identifying_tokens(names: list[str], expected: set[str]) -> None:
+    assert identifying_tokens(names) == expected

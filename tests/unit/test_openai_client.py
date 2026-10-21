@@ -1,23 +1,34 @@
+import logging
 from types import SimpleNamespace
 from typing import Any
 
+import openai
 import pytest
+from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.llm import prompts
 from app.llm.base import LLMError
+from app.llm.judging import CharacterCard, RelationTypeCard
 from app.llm.openai_client import OpenAILLMClient, build_openai_client
-from app.llm.schemas import ExtractionResult, ImageAnalysis
+from app.llm.schemas import ExtractionResult, ImageAnalysis, Judgement, Verdict
 from tests.factories import harry_and_ron
 
 
 class StubCompletions:
-    def __init__(self, message: SimpleNamespace) -> None:
+    def __init__(self, message: SimpleNamespace, usage: SimpleNamespace | None = None) -> None:
         self.message = message
+        self.usage = usage
+        self.error: Exception | None = None
+        self.choices: list[SimpleNamespace] | None = None
         self.calls: list[dict[str, Any]] = []
 
     async def parse(self, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(kwargs)
-        return SimpleNamespace(choices=[SimpleNamespace(message=self.message)])
+        if self.error:
+            raise self.error
+        choices = [SimpleNamespace(message=self.message)] if self.choices is None else self.choices
+        return SimpleNamespace(choices=choices, usage=self.usage)
 
 
 class StubEmbeddings:
@@ -31,14 +42,17 @@ class StubEmbeddings:
         return SimpleNamespace(data=list(reversed(data)))
 
 
-def make_client(message: SimpleNamespace) -> tuple[OpenAILLMClient, StubCompletions, StubEmbeddings]:
-    completions = StubCompletions(message)
+def make_client(
+    message: SimpleNamespace, usage: SimpleNamespace | None = None
+) -> tuple[OpenAILLMClient, StubCompletions, StubEmbeddings]:
+    completions = StubCompletions(message, usage)
     embeddings = StubEmbeddings()
     sdk = SimpleNamespace(chat=SimpleNamespace(completions=completions), embeddings=embeddings)
     client = OpenAILLMClient(
         sdk,  # type: ignore[arg-type]
         llm_model="extract-model",
         vision_model="vision-model",
+        judge_model="judge-model",
         embedding_model="embed-model",
         embedding_dimensions=8,
         concurrency=2,
@@ -99,6 +113,122 @@ async def test_embed_empty_input_makes_no_call() -> None:
 
     assert await client.embed([]) == []
     assert embeddings.calls == []
+
+
+JUDGEMENT = Judgement(verdicts=[Verdict(item="N1", reason="same person", decision="stored", match="S1")])
+
+
+async def test_judge_characters_uses_structured_output() -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=JUDGEMENT, refusal=None))
+    new = [CharacterCard("N1", "Ronald", (), "Ron's full name", ("S1",))]
+    known = [CharacterCard("S1", "Ron Weasley", ("Ron",), "Harry's friend")]
+
+    result = await client.judge_characters(new, known)
+
+    assert result == JUDGEMENT
+    call = completions.calls[0]
+    assert call["model"] == "judge-model"
+    assert call["response_format"] is Judgement
+    system, user = call["messages"]
+    assert system["content"] == prompts.CHARACTER_JUDGE_SYSTEM_PROMPT.strip()
+    assert user["content"] == (
+        "Known characters:\n"
+        "S1 | Ron Weasley | aliases: Ron | Harry's friend\n"
+        "\n"
+        "New characters to resolve:\n"
+        "N1 | Ronald | aliases: none | Ron's full name | candidates: S1"
+    )
+
+
+async def test_judge_relation_types_uses_structured_output() -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=JUDGEMENT, refusal=None))
+    new = [RelationTypeCard("N1", "FRIENDS_WITH", ("S1",))]
+    known = [RelationTypeCard("S1", "FRIEND_OF")]
+
+    result = await client.judge_relation_types(new, known)
+
+    assert result == JUDGEMENT
+    call = completions.calls[0]
+    assert call["model"] == "judge-model"
+    assert call["response_format"] is Judgement
+    system, user = call["messages"]
+    assert system["content"] == prompts.RELATION_TYPE_JUDGE_SYSTEM_PROMPT.strip()
+    assert user["content"] == (
+        "Known relation types:\nS1 | FRIEND_OF\n\nNew relation types to resolve:\nN1 | FRIENDS_WITH | candidates: S1"
+    )
+
+
+async def test_judge_rendering_with_no_known_items() -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=JUDGEMENT, refusal=None))
+
+    await client.judge_relation_types([RelationTypeCard("N1", "A_OF"), RelationTypeCard("N2", "B_OF")], [])
+
+    assert completions.calls[0]["messages"][-1]["content"] == (
+        "Known relation types:\n"
+        "none\n"
+        "\n"
+        "New relation types to resolve:\n"
+        "N1 | A_OF | candidates: none\n"
+        "N2 | B_OF | candidates: none"
+    )
+
+
+async def test_judge_raises_on_refusal() -> None:
+    client, _, _ = make_client(SimpleNamespace(parsed=None, refusal="no"))
+
+    with pytest.raises(LLMError, match="refused"):
+        await client.judge_characters([CharacterCard("N1", "A", (), "")], [])
+
+
+async def test_parse_logs_token_usage(caplog: pytest.LogCaptureFixture) -> None:
+    usage = SimpleNamespace(prompt_tokens=12, completion_tokens=3)
+    client, _, _ = make_client(SimpleNamespace(parsed=JUDGEMENT, refusal=None), usage)
+
+    with caplog.at_level(logging.INFO, logger="app.llm.openai_client"):
+        await client.judge_relation_types([RelationTypeCard("N1", "A_OF")], [])
+
+    assert "judge-model used 12 prompt + 3 completion tokens" in caplog.text
+
+
+def truncated() -> openai.LengthFinishReasonError:
+    return openai.LengthFinishReasonError(completion=SimpleNamespace(usage=None))  # type: ignore[arg-type]
+
+
+async def test_truncated_extraction_suggests_smaller_chunks() -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=None, refusal=None))
+    completions.error = truncated()
+
+    with pytest.raises(LLMError, match="CHUNK_SIZE_CHARS"):
+        await client.extract("text", known_relation_types=[])
+
+
+async def test_truncated_judge_answer_gives_a_neutral_message() -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=None, refusal=None))
+    completions.error = truncated()
+
+    with pytest.raises(LLMError, match="truncated") as info:
+        await client.judge_characters([CharacterCard("N1", "A", (), "")], [])
+
+    assert "CHUNK_SIZE_CHARS" not in str(info.value)
+
+
+async def test_malformed_model_output_becomes_llm_error() -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=None, refusal=None))
+    try:
+        Judgement.model_validate({})
+    except ValidationError as exc:
+        completions.error = exc
+
+    with pytest.raises(LLMError, match="malformed"):
+        await client.judge_relation_types([RelationTypeCard("N1", "A_OF")], [])
+
+
+async def test_empty_choices_become_llm_error() -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=None, refusal=None))
+    completions.choices = []
+
+    with pytest.raises(LLMError, match="no choices"):
+        await client.judge_relation_types([RelationTypeCard("N1", "A_OF")], [])
 
 
 def test_build_client_ignores_empty_base_url_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:

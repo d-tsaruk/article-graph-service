@@ -31,7 +31,7 @@ until `OPENAI_API_KEY` is set. Neo4j Browser is available at http://localhost:74
                    │                   ├─ 3. chunking.chunk_text (paragraph packing+overlap)│
                    │                   ├─ 4. LLM extraction per chunk (Structured Outputs)  │
                    │                   ├─ 5. merging.merge_extractions (union-find)         │
-                   │                   ├─ 6. resolution: dedup vs. graph (vector index)     │
+                   │                   ├─ 6. resolution: vector/name candidates → LLM judge │
                    │                   └─ 7. graph/repository: persist                      │
                    └───────────────┬───────────────────────────────┬────────────────────────┘
                                    │ Bolt                          │ HTTPS
@@ -64,43 +64,70 @@ until `OPENAI_API_KEY` is set. Neo4j Browser is available at http://localhost:74
    paragraphs, so that relations described across a boundary are seen together.
 5. **Extraction.** Chunks are processed concurrently, bounded by `LLM_CONCURRENCY`. Each call uses OpenAI
    Structured Outputs (`chat.completions.parse` with a Pydantic `response_format`, strict JSON schema), so the
-   response is validated before the pipeline sees it. Refusals, truncation and API errors become `502`. Relation
-   types already present in the graph are passed to the prompt as a preferred vocabulary.
+   response is validated before the pipeline sees it. Refusals, truncation and API errors become `502`. The
+   canonical relation vocabulary and the types already used in the graph are passed as preferred types.
 6. **In-article merge.** Characters from all chunks are unified with union-find over normalized names and aliases.
    Relations are rewritten to canonical names, typed (`UPPER_SNAKE_CASE`) and deduplicated. Relations that point to
    unknown characters, and self-loops, are dropped.
-7. **Resolution against the graph** (see [Deduplication](#deduplication-and-the-vector-index)).
+7. **Resolution against the graph** (see [Deduplication](#deduplication-and-the-vector-index)). Only reads and LLM
+   calls, no writes, except the idempotent seed of the relation-type vocabulary.
 8. **Persistence.** The article is created as `processing`. Characters, mentions and relations are written, then
-   the article is marked `completed`. Steps 1–6 have no side effects, and a failure in step 8 deletes the article,
-   so a failed upload does not leave a half-written article behind.
+   the article is marked `completed`. Every LLM call, including both judges, finishes before the first write, so an
+   LLM failure (502) leaves the graph unchanged except for the idempotent vocabulary seed. A Neo4j failure during
+   the writes deletes the article and its relations. Characters created or updated and relation types created
+   before the failure remain.
 
 ### Deduplication and the vector index
 
 Both indexes are Neo4j native vector indexes (HNSW, cosine). Neo4j reports cosine similarity as
-`score = (1 + cos) / 2` ∈ [0, 1]; all thresholds below are on that scale.
+`score = (1 + cos) / 2` ∈ [0, 1]; all scores below are on that scale.
 
-| Index                     | Node / property          | Embedded text                         | Used for                                 |
-|---------------------------|--------------------------|---------------------------------------|------------------------------------------|
-| `character_embedding`     | `Character.embedding`    | `name (also known as …): description` | merging a new character into a known one |
-| `relation_type_embedding` | `RelationType.embedding` | `friend of` (from `FRIEND_OF`)        | synonym types on write and on query      |
+| Index                     | Node / property          | Embedded text                         | Used for                                               |
+|---------------------------|--------------------------|---------------------------------------|--------------------------------------------------------|
+| `character_embedding`     | `Character.embedding`    | `name (also known as …): description` | candidate characters for the judge                     |
+| `relation_type_embedding` | `RelationType.embedding` | `friend of` (from `FRIEND_OF`)        | candidate types for the judge, on write and on query   |
 
-**Characters.** Each extracted character is matched in order:
+**Why not thresholds.** Probes (hand-written pairs, `text-embedding-3-small`) gave Arthur ~ Molly Weasley 0.939,
+while true aliases scored 0.78–0.88. In a real run, different characters of the same story reached 0.87, and
+relation inverses (bullied by / bullies 0.867) sat inside the synonym range (0.83–0.92). No threshold separates
+them, so the index only retrieves candidates and an LLM decides.
 
-1. Exact match of any normalized name or alias (case, Unicode width and punctuation are ignored).
-2. Otherwise, the top 5 vector neighbours. A candidate is accepted when
-   - `score ≥ CHARACTER_AUTO_MERGE_SCORE` (0.97), or
-   - `score ≥ CHARACTER_MATCH_SCORE` (0.93) **and** the names share an identifying token (honorifics such as
-     `Mr`, `Professor`, `Lord` are ignored). So `Mr. Potter` merges into `Harry Potter`, while two different
-     `Dursley`s with different descriptions do not.
-3. Otherwise a new character is created. A merged name becomes an alias of the stored character.
+**Characters.**
 
-Characters are resolved one by one on purpose: a character created a moment ago must already be visible
-to the vector index when the next one is resolved.
+1. An exact canonical-name match merges directly.
+2. Otherwise the candidates are the union of three channels: stored characters sharing a name or alias (`Weasley`);
+   stored characters sharing an identifying name token (honorifics are ignored); and the top
+   `CHARACTER_CANDIDATE_LIMIT` (10) vector neighbours, with no score floor. k is the recall knob.
+3. One judge call per upload sees all candidates and all new characters (references `S…` / `N…`), and answers per
+   character: `stored`, `same_as_new` or `new`. In-article duplicates from different chunks are caught there.
+4. Invalid answers (an unknown reference, a candidate that was not offered, a missing item) count as `new`: a
+   duplicate is cheaper than a wrong merge.
 
-**Relation types.** On write, a new type such as `FRIENDS_WITH` reuses the closest stored type such as `FRIEND_OF`
-when `score ≥ RELATION_TYPE_MATCH_SCORE` (0.95), so the vocabulary does not fragment into synonyms. On read,
-`GET /relations/connected/{id}?type=buddy of` normalizes the input to `BUDDY_OF`, then tries an exact match, then
-the nearest stored type. The response shows what was used in `resolved_type`.
+**Relation types.**
+
+- The canonical vocabulary (`PARENT_OF`, `SIBLING_OF`, `MARRIED_TO`, `RELATIVE_OF`, `GUARDIAN_OF`, `FRIEND_OF`,
+  `ENEMY_OF`, `ROMANTIC_PARTNER_OF`, `WORKS_FOR`, `TEACHER_OF`, `MENTOR_OF`, `BULLIES`, `KILLED`, `PROTECTS`) is seeded
+  as `RelationType` nodes on first use.
+- An exact match is used directly.
+- Otherwise the top 5 neighbours with `score ≥ RELATION_TYPE_CANDIDATE_SCORE` (0.75) go to one judge call per upload.
+  The judge maps only to the same or a more general type **in the same direction**: inverses and opposites never
+  merge. A specific type collapses to the general one (`FATHER_OF` → `PARENT_OF`), and the nuance stays in the
+  relation `description`. The known inverse of a type is never offered as its candidate, so this holds in code and
+  not only in the prompt.
+- Only types used by stored edges get a node.
+
+**Query.** `GET /relations/connected/{id}?type=…` resolves the type in this order:
+
+1. a known inverse, checked first so that a stray stored `CHILD_OF` cannot hide the `PARENT_OF` edges
+   (`CHILD_OF` → `PARENT_OF`, `WARD_OF` → `GUARDIAN_OF`, `EMPLOYS` → `WORKS_FOR`,
+   `STUDENT_OF` → `TEACHER_OF`, `MENTEE_OF` → `MENTOR_OF`, `BULLIED_BY` → `BULLIES`, `KILLED_BY` → `KILLED`,
+   `PROTECTED_BY` → `PROTECTS`), answered with the direction flipped and no LLM call;
+2. exact match;
+3. vector candidates, then the judge;
+4. otherwise `resolved_type: null`.
+
+**Cost.** At most 2 extra small chat calls per upload (`gpt-4o-mini` by default; token usage is logged at INFO).
+A query costs one call only for a non-exact, non-inverse type.
 
 ### Graph schema
 
@@ -211,10 +238,22 @@ curl -s -G $BASE/relations/connected/<character_id> -H "$AUTH" -d type=PARENT_OF
 #  "connections":[{"character":{"id":"…","name":"Ron Weasley",…},"direction":"outgoing","description":"…"}]}
 ```
 
+## Sample articles
+
+`samples/01-two-families.md` and `samples/02-summer-at-the-burrow.md` exercise dedup end to end. Upload them in
+order with the `3b` command above (`-F 'file=@samples/01-two-families.md'`, then the second file), then inspect
+`GET /characters` and `GET /relations/types`.
+
+Expected outcome with a capable model:
+
+- one node each for Ron / Ronald, Harry / the Boy Who Lived and Voldemort / Tom Riddle;
+- separate Arthur, Molly and Percy;
+- family relations as `PARENT_OF` / `MARRIED_TO` / `RELATIVE_OF`, and no `*_BY` types.
+
 ## Prompts
 
 The prompts live in [`app/llm/prompts.py`](app/llm/prompts.py). A test checks that the texts below match it exactly.
-Both calls use Structured Outputs. The JSON schema comes from the Pydantic models in
+All calls use Structured Outputs. The JSON schema comes from the Pydantic models in
 [`app/llm/schemas.py`](app/llm/schemas.py), and their field descriptions also guide the model.
 
 ### Character and relation extraction — system
@@ -228,18 +267,33 @@ that appears in or is discussed by the text. Groups, organisations, places and o
 Rules:
 1. Extract only what the text states or directly implies. Never use outside knowledge.
 2. Merge all mentions of the same character into one entry. Use the most complete proper name as `name`
-   and list every other way the text refers to them in `aliases` (first names, surnames, nicknames, titles).
-   Do not list pronouns or generic descriptions ("the boy") as aliases.
+   and list every other way the text refers to them in `aliases` (first names, nicknames, titles with surnames).
+   Do not list pronouns or generic descriptions ("the boy") as aliases. Never list an alias that the text
+   also uses for another character, such as a bare family surname.
 3. `description` is one or two sentences describing who the character is according to the text.
 4. Extract relations only between characters from your `characters` list; `source` and `target` must be
    exactly their `name` values. Never relate a character to itself.
-5. `type` is a short verb phrase in UPPER_SNAKE_CASE that reads naturally as `source TYPE target`,
-   e.g. FRIEND_OF, PARENT_OF, MARRIED_TO, WORKS_FOR, MENTOR_OF, ENEMY_OF, SIBLING_OF.
-   Use the most specific type supported by the text. Prefer a type from the known types list when it
-   fits the meaning; invent a new one only when none fits.
-6. For directed relations choose the direction carefully (PARENT_OF goes from parent to child).
-   For symmetric relations (FRIEND_OF, SIBLING_OF, MARRIED_TO) emit a single relation.
-7. If the text contains no characters, return empty lists.
+5. `type` is a relation type in UPPER_SNAKE_CASE that reads naturally as `source TYPE target`.
+   Use one of these canonical types whenever it fits, choosing the general type over a specific one:
+   - family: PARENT_OF, SIBLING_OF, MARRIED_TO, RELATIVE_OF (aunts, uncles, cousins, grandparents, in-laws)
+   - care: GUARDIAN_OF
+   - social: FRIEND_OF, ENEMY_OF, ROMANTIC_PARTNER_OF
+   - work: WORKS_FOR, TEACHER_OF, MENTOR_OF
+   - actions: BULLIES, KILLED, PROTECTS
+   Otherwise prefer a type from the known types list, and invent a new general type only when nothing fits.
+   Put the nuance into the relation `description`, not into the type: "father of" is PARENT_OF,
+   "best friends" is FRIEND_OF, "uncle of" is RELATIVE_OF.
+6. Use active voice: `source` is the one who acts or holds the role. Never use passive or inverse types
+   such as BULLIED_BY or CHILD_OF; write "Dudley BULLIES Harry" and "Molly PARENT_OF Ron".
+   For symmetric types (SIBLING_OF, MARRIED_TO, RELATIVE_OF, FRIEND_OF, ENEMY_OF, ROMANTIC_PARTNER_OF)
+   emit a single relation.
+7. Extract every family relation the text states, even in passing: parents and children, spouses, siblings,
+   aunts, uncles and cousins, guardians.
+8. Split compound facts into basic relations: "Voldemort killed Harry's parents" becomes KILLED from
+   Voldemort to each parent who is a character.
+9. Use WORKS_FOR for a work hierarchy (a teacher who reports to a headmaster WORKS_FOR the headmaster).
+   Use MENTOR_OF only when the text describes personal guidance.
+10. If the text contains no characters, return empty lists.
 ```
 
 ### Character and relation extraction — user
@@ -260,6 +314,89 @@ Response schema (`ExtractionResult`):
   "characters": [{"name": "str", "aliases": ["str"], "description": "str"}],
   "relations":  [{"source": "str", "target": "str", "type": "UPPER_SNAKE_CASE", "description": "str"}]
 }
+```
+
+### Character judge — system
+
+```text
+You decide whether newly extracted characters are the same individuals as characters already stored
+in a knowledge graph, or as each other.
+
+You receive "Known characters" (references S1, S2, ...) and "New characters to resolve"
+(references N1, N2, ...). Each new character lists the known characters that are its candidates.
+
+For every new character return exactly one verdict:
+- decision "stored", match = one of ITS candidate references, when it is certainly the same individual
+  as that known character;
+- decision "same_as_new", match = another N reference, when it is the same individual as another new
+  character and matches none of its candidates;
+- decision "new", match = null, otherwise.
+
+Rules:
+1. Same individual means the same person or being, not merely the same family, role or name part.
+   Family members who share a surname (parent and child, husband and wife, siblings) are different individuals.
+2. A first name, a nickname, a title with a surname, a full name, an epithet or a former or secret name can
+   refer to the same individual when the descriptions are consistent with each other.
+3. Contradicting descriptions (different parents, spouses, ages or roles) mean different individuals.
+4. If you are not sure, answer "new". A missed merge is cheaper than a wrong one.
+5. Use only the information given. Write the `reason` before deciding.
+```
+
+### Character judge — user
+
+```text
+Known characters:
+{known}
+
+New characters to resolve:
+{new}
+```
+
+### Relation-type judge — system
+
+```text
+You keep the vocabulary of relation types in a knowledge graph free of synonyms.
+A relation type reads as `source TYPE target`, for example `Arthur PARENT_OF Ron`.
+
+You receive "Known relation types" (references S1, S2, ...) and "New relation types to resolve"
+(references N1, N2, ...). Each new type lists the known types that are its candidates.
+
+For every new type return exactly one verdict:
+- decision "stored", match = one of ITS candidate references, when that known type means the same
+  as the new type, or is a more general form of it, in the same direction;
+- decision "same_as_new", match = another N reference, under the same condition, when none of its
+  candidates fits; point to the more general of the two types, and if several qualify, to the one
+  closest in meaning;
+- decision "new", match = null, otherwise.
+
+Rules:
+1. Direction matters. Map only if `A NEW_TYPE B` implies `A KNOWN_TYPE B` for the same A and B.
+   An inverse is never the same: CHILD_OF is not PARENT_OF, BULLIED_BY is not BULLIES,
+   EMPLOYS is not WORKS_FOR.
+2. Different or opposite relations are never the same: DIVORCED_FROM is not MARRIED_TO,
+   ENEMY_OF is not FRIEND_OF.
+3. Map a specific type to its general form: FATHER_OF -> PARENT_OF, SPOUSE_OF -> MARRIED_TO,
+   BEST_FRIENDS_WITH -> FRIEND_OF. Never map a general type to a more specific one: PARENT_OF is not FATHER_OF.
+4. If several known types qualify, choose the most specific of them, the one closest in meaning:
+   FATHER_OF -> PARENT_OF, not RELATIVE_OF.
+5. If you are not sure, answer "new".
+6. Write the `reason` before deciding.
+```
+
+### Relation-type judge — user
+
+```text
+Known relation types:
+{known}
+
+New relation types to resolve:
+{new}
+```
+
+Both judges answer with `Judgement` (`app/llm/schemas.py`):
+
+```json
+{"verdicts": [{"item": "N1", "reason": "str", "decision": "stored|same_as_new|new", "match": "S1|N2|null"}]}
 ```
 
 ### Image analysis (vision) — system
@@ -295,11 +432,16 @@ All settings are environment variables (see [`app/core/config.py`](app/core/conf
 | `ACCESS_TOKEN_TTL_SECONDS` / `REFRESH_TOKEN_TTL_SECONDS` | 900 / 86400 | |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | — | any OpenAI-compatible backend |
 | `LLM_MODEL` / `VISION_MODEL` | `gpt-4o-mini` | must support Structured Outputs; the vision model must accept images |
+| `JUDGE_MODEL` | `gpt-4o-mini` | must support Structured Outputs |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | `text-embedding-3-small` / 1536 | changing the dimension requires a fresh database (the vector index is created with it) |
 | `LLM_CONCURRENCY` | 4 | parallel LLM calls per process |
 | `CHUNK_SIZE_CHARS` / `CHUNK_OVERLAP_CHARS` | 12000 / 800 | |
 | `PDF_MAX_VISUAL_ITEMS` | 30 | cap on vision calls per document |
-| `CHARACTER_MATCH_SCORE` / `CHARACTER_AUTO_MERGE_SCORE` / `RELATION_TYPE_MATCH_SCORE` | 0.93 / 0.97 / 0.95 | Neo4j score scale |
+| `CHARACTER_CANDIDATE_LIMIT` | 10 | vector candidates per new character (recall knob) |
+| `RELATION_TYPE_CANDIDATE_SCORE` | 0.75 | Neo4j score scale |
+| `API_PORT` / `NEO4J_HTTP_PORT` / `NEO4J_BOLT_PORT` | 8000 / 7474 / 7687 | host ports (compose) |
+
+Stronger models (e.g. `gpt-4o`) for `LLM_MODEL` and `JUDGE_MODEL` improve extraction and dedup quality at a higher cost.
 
 ## Tests
 
@@ -310,14 +452,16 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 - **Unit tests** (`tests/unit`): chunking, name and type normalization, in-article merging, PDF parsing
   (text, embedded images, scanned pages, vector graphics, image dedup, cap), the OpenAI client (structured output
-  request, refusal handling, base64 images, embedding order), settings, and the README/prompt sync.
+  request, refusal handling, base64 images, embedding order), settings, judge verdict grouping, vocabulary and
+  prompt consistency, and the README/prompt sync.
 - **Integration tests** (`tests/integration`) start a real Neo4j 5.26 via
   [testcontainers](https://testcontainers.com/), so Docker must be running. They go through the HTTP API, with the
   LLM replaced by a deterministic fake (bag-of-words embeddings). They check auth (pair issue, refresh, wrong token
   type, expiry, every protected route), uploads (Markdown text and file, PDF with images, duplicates, validation
   errors, rollback on LLM failure), and every read endpoint. Persistence is checked **directly in Neo4j** with a
-  separate driver: nodes, `MENTIONS` and `RELATED_TO` edges, embeddings, and vector-based deduplication of
-  characters and relation types.
+  separate driver: nodes, `MENTIONS` and `RELATED_TO` edges, embeddings, candidate retrieval and LLM-judge dedup of
+  characters and relation types (a deterministic fake judge declares which names are the same, so the tests prove the
+  decision path, not model quality), inverse queries, and rollback on judge failure.
 - To use an already running Neo4j instead: `TEST_NEO4J_URI=bolt://localhost:7687 TEST_NEO4J_PASSWORD=… pytest`.
   **The tests wipe that database.**
 
@@ -329,8 +473,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
   content hash are already in place for this.
 - **Concurrent uploads that introduce the same new character** can, rarely, create it twice. This needs a
   per-name lock or a periodic merge job.
-- **Entity resolution** relies on thresholds plus a name heuristic. The next step is LLM adjudication for
-  borderline candidates (score between the two thresholds).
+- **Recall is bounded by the candidate channels.** An alias with no shared name token that ranks outside the vector
+  top-k is never judged, and becomes a duplicate.
+- **Existing data is not re-resolved.** Earlier wrong merges or types stay until re-ingested into a fresh database.
+- **In-article merging** (union-find over names and aliases) does not use the judge. The prompt forbids shared-surname
+  aliases, but a model that ignores this merges two people.
+- **Only the listed inverses are answered on query.** A paraphrased inverse such as `son of` resolves to nothing.
+- **One judge call per upload is not split.** Very large articles produce one large prompt.
 - **Symmetric relations** (`FRIEND_OF`) are stored in the direction the model emitted them. Queries use
   `direction=any` by default, so this does not affect lookups.
 - **Refresh tokens** are not rotated with revocation (stateless JWT). The `jti` claim is there to add a denylist.

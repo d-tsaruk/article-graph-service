@@ -15,12 +15,13 @@ from app.graph.repository import (
     GraphRepository,
     RelationRecord,
 )
-from app.llm.base import LLMClient
+from app.llm.base import LLMClient, LLMError
 from app.llm.schemas import ExtractionResult, ImageAnalysis
+from app.llm.vocabulary import CANONICAL_RELATION_TYPES
 from app.pipeline.chunking import chunk_text
 from app.pipeline.documents import DocumentError, ParsedDocument, PdfOptions, parse_markdown, parse_pdf
 from app.pipeline.merging import merge_extractions
-from app.pipeline.resolution import CharacterResolver, RelationTypeResolver
+from app.pipeline.resolution import CharacterResolver, RelationTypeResolver, TypePlan
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +58,16 @@ class IngestionResult:
     relations: list[RelationRecord]
 
 
+def unwrap_plan_failure(failure: ExceptionGroup) -> BaseException:
+    """Logs every failed plan and picks the one to raise: an LLMError (502/503) if any, else the first."""
+    for exc in failure.exceptions:
+        logger.error("Resolution planning failed: %r", exc, exc_info=exc)
+    return next((exc for exc in failure.exceptions if isinstance(exc, LLMError)), failure.exceptions[0])
+
+
 class ArticleIngestionService:
-    """parse -> describe visuals -> chunk -> extract (LLM) -> merge -> resolve against graph -> persist.
-    Everything up to persistence is side-effect free, so a failed LLM call leaves the graph untouched."""
+    """parse -> describe visuals -> chunk -> extract -> merge -> plan resolution (reads + LLM judges) -> persist.
+    All LLM calls finish before the first graph write, except the idempotent vocabulary seed."""
 
     def __init__(
         self,
@@ -72,12 +80,7 @@ class ArticleIngestionService:
         self._llm = llm
         self._settings = settings
         self._relation_types = relation_types
-        self._characters = CharacterResolver(
-            repository,
-            llm,
-            match_score=settings.character_match_score,
-            auto_merge_score=settings.character_auto_merge_score,
-        )
+        self._characters = CharacterResolver(repository, llm, candidate_limit=settings.character_candidate_limit)
         self._pdf_options = PdfOptions(
             max_visual_items=settings.pdf_max_visual_items,
             min_image_side_px=settings.pdf_min_image_side_px,
@@ -161,7 +164,9 @@ class ArticleIngestionService:
 
     async def _extract(self, text: str) -> ExtractionResult:
         chunks = chunk_text(text, self._settings.chunk_size_chars, self._settings.chunk_overlap_chars)
-        known_types = await self._repository.list_relation_type_names(KNOWN_RELATION_TYPES_IN_PROMPT)
+        used = [name for name, _ in await self._repository.list_relation_types()]
+        known_types = [*CANONICAL_RELATION_TYPES, *sorted(set(used) - set(CANONICAL_RELATION_TYPES))]
+        known_types = known_types[:KNOWN_RELATION_TYPES_IN_PROMPT]
         results = await asyncio.gather(*(self._llm.extract(chunk, known_types) for chunk in chunks))
         logger.info("Extracted from %d chunks", len(chunks))
         return merge_extractions(list(results))
@@ -169,15 +174,25 @@ class ArticleIngestionService:
     async def _persist(
         self, *, title: str, source_type: SourceType, content_hash: str, text: str, extraction: ExtractionResult
     ) -> IngestionResult:
+        try:
+            async with asyncio.TaskGroup() as group:  # cancels the sibling plan if one fails
+                type_task = group.create_task(self._relation_types.plan([r.type for r in extraction.relations]))
+                character_task = group.create_task(self._characters.plan(extraction.characters))
+        except ExceptionGroup as failure:
+            # Plain `except`, not `except*`: raising inside `except*` would wrap the error in a group again.
+            raise unwrap_plan_failure(failure) from None
+        type_plan, character_plan = type_task.result(), character_task.result()
+
         article_id = str(uuid.uuid4())
         await self._repository.create_article(
             article_id=article_id, title=title, source_type=source_type.value, content_hash=content_hash, text=text
         )
         try:
-            resolved = await self._characters.resolve(extraction.characters)
+            resolved = await self._characters.apply(character_plan)
             characters = list({record.id: record for record in resolved.values()}.values())
             await self._repository.link_characters_to_article(article_id, [c.id for c in characters])
-            relations = await self._resolve_relations(extraction, resolved)
+            relations = _build_relations(extraction, resolved, type_plan)
+            await self._relation_types.create_used(type_plan, {r.type for r in relations})
             await self._repository.upsert_relations(
                 article_id,
                 [
@@ -205,25 +220,26 @@ class ArticleIngestionService:
             relations=relations,
         )
 
-    async def _resolve_relations(
-        self, extraction: ExtractionResult, resolved: dict[str, CharacterRecord]
-    ) -> list[RelationRecord]:
-        relations: dict[tuple[str, str, str], RelationRecord] = {}
-        for relation in extraction.relations:
-            source, target = resolved[relation.source], resolved[relation.target]
-            # Two extracted names may resolve to one stored character.
-            if source.id == target.id:
-                continue
-            relation_type = await self._relation_types.resolve_or_create(relation.type)
-            relations.setdefault(
-                (source.id, target.id, relation_type),
-                RelationRecord(
-                    source_id=source.id,
-                    source_name=source.name,
-                    target_id=target.id,
-                    target_name=target.name,
-                    type=relation_type,
-                    description=relation.description,
-                ),
-            )
-        return list(relations.values())
+
+def _build_relations(
+    extraction: ExtractionResult, resolved: dict[str, CharacterRecord], type_plan: TypePlan
+) -> list[RelationRecord]:
+    relations: dict[tuple[str, str, str], RelationRecord] = {}
+    for relation in extraction.relations:
+        source, target = resolved[relation.source], resolved[relation.target]
+        # Two extracted names may resolve to one stored character.
+        if source.id == target.id:
+            continue
+        relation_type = type_plan.mapping[relation.type]
+        relations.setdefault(
+            (source.id, target.id, relation_type),
+            RelationRecord(
+                source_id=source.id,
+                source_name=source.name,
+                target_id=target.id,
+                target_name=target.name,
+                type=relation_type,
+                description=relation.description,
+            ),
+        )
+    return list(relations.values())

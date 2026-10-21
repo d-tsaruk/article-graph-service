@@ -1,6 +1,7 @@
 from typing import Protocol
 
-from app.llm.schemas import ExtractionResult, ImageAnalysis
+from app.llm.judging import CharacterCard, RelationTypeCard
+from app.llm.schemas import ExtractionResult, ImageAnalysis, Judgement
 
 
 class LLMError(Exception):
@@ -18,6 +19,10 @@ class LLMClient(Protocol):
 
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
 
+    async def judge_characters(self, new: list[CharacterCard], known: list[CharacterCard]) -> Judgement: ...
+
+    async def judge_relation_types(self, new: list[RelationTypeCard], known: list[RelationTypeCard]) -> Judgement: ...
+
 
 class UnconfiguredLLMClient:
     """Keeps read-only endpoints usable when no API key is provided."""
@@ -29,4 +34,10 @@ class UnconfiguredLLMClient:
         raise LLMNotConfiguredError("OPENAI_API_KEY is not configured")
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise LLMNotConfiguredError("OPENAI_API_KEY is not configured")
+
+    async def judge_characters(self, new: list[CharacterCard], known: list[CharacterCard]) -> Judgement:
+        raise LLMNotConfiguredError("OPENAI_API_KEY is not configured")
+
+    async def judge_relation_types(self, new: list[RelationTypeCard], known: list[RelationTypeCard]) -> Judgement:
         raise LLMNotConfiguredError("OPENAI_API_KEY is not configured")

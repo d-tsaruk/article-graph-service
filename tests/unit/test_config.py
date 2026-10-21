@@ -35,8 +35,34 @@ def test_environment_variables_are_read(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("APP_TOKENS", "env-token")
     monkeypatch.setenv("JWT_SECRET", SECRET)
     monkeypatch.setenv("EMBEDDING_DIMENSIONS", "256")
+    monkeypatch.setenv("JUDGE_MODEL", "judge-x")
+    monkeypatch.setenv("CHARACTER_CANDIDATE_LIMIT", "3")
+    monkeypatch.setenv("RELATION_TYPE_CANDIDATE_SCORE", "0.8")
 
     settings = Settings(_env_file=None)
 
     assert settings.app_tokens == ["env-token"]
     assert settings.embedding_dimensions == 256
+    assert settings.judge_model == "judge-x"
+    assert settings.character_candidate_limit == 3
+    assert settings.relation_type_candidate_score == 0.8
+
+
+def test_dedup_defaults() -> None:
+    settings = make()
+
+    assert settings.judge_model == "gpt-4o-mini"
+    assert settings.character_candidate_limit == 10
+    assert settings.relation_type_candidate_score == 0.75
+
+
+REMOVED = ["CHARACTER_" + "MATCH_SCORE", "CHARACTER_" + "AUTO_MERGE_SCORE", "RELATION_TYPE_" + "MATCH_SCORE"]
+
+
+@pytest.mark.parametrize("name", REMOVED)
+def test_old_score_settings_are_ignored(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    monkeypatch.setenv(name, "0.5")
+
+    settings = make()
+
+    assert not hasattr(settings, name.lower())
