@@ -243,3 +243,59 @@ def test_failed_extraction_leaves_no_article(
     assert response.status_code == 502
     records, _, _ = db.execute_query("MATCH (a:Article) RETURN count(a) AS n")
     assert records[0]["n"] == 0
+
+
+def friend_edges(db: neo4j.Driver) -> list[tuple[str, str, list[str]]]:
+    records, _, _ = db.execute_query(
+        "MATCH (s:Character)-[r:RELATED_TO {type: 'FRIEND_OF'}]->(t:Character) "
+        "RETURN s.name AS s, t.name AS t, r.article_ids AS articles"
+    )
+    return [(r["s"], r["t"], r["articles"]) for r in records]
+
+
+def test_symmetric_relation_stated_in_both_directions_is_stored_once(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.extraction = extraction(
+        [character("Harry Potter", HARRY_DESCRIPTION), character("Ron Weasley", RON_DESCRIPTION)],
+        [relation("Harry Potter", "Ron Weasley", "FRIEND_OF"), relation("Ron Weasley", "Harry Potter", "FRIEND_OF")],
+    )
+
+    body = upload_markdown(client, auth_headers)
+
+    assert [(r["source_name"], r["target_name"]) for r in body["relations"]] == [("Harry Potter", "Ron Weasley")]
+    assert friend_edges(db) == [("Harry Potter", "Ron Weasley", [body["article_id"]])]
+
+
+def test_symmetric_relation_is_not_duplicated_by_a_later_article_in_the_reverse_direction(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.extraction = harry_and_ron()
+    first = upload_markdown(client, auth_headers)
+    fake_llm.extraction = extraction(
+        [character("Harry Potter", HARRY_DESCRIPTION), character("Ron Weasley", RON_DESCRIPTION)],
+        [relation("Ron Weasley", "Harry Potter", "FRIEND_OF")],
+    )
+    fake_llm.same_characters = [{"Harry Potter"}, {"Ron Weasley"}]
+
+    second = upload_markdown(client, auth_headers, text="Ron and Harry played chess.")
+
+    assert friend_edges(db) == [("Harry Potter", "Ron Weasley", [first["article_id"], second["article_id"]])]
+
+
+def test_synonym_mapped_to_a_symmetric_type_dedupes_against_the_reverse_edge(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.embedding_overrides = {"best friends with": "friend of"}
+    fake_llm.same_relation_types = {("BEST_FRIENDS_WITH", "FRIEND_OF")}
+    fake_llm.extraction = extraction(
+        [character("Harry Potter", HARRY_DESCRIPTION), character("Ron Weasley", RON_DESCRIPTION)],
+        [
+            relation("Harry Potter", "Ron Weasley", "FRIEND_OF"),
+            relation("Ron Weasley", "Harry Potter", "BEST_FRIENDS_WITH"),
+        ],
+    )
+
+    body = upload_markdown(client, auth_headers)
+
+    assert friend_edges(db) == [("Harry Potter", "Ron Weasley", [body["article_id"]])]

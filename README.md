@@ -115,6 +115,11 @@ them, so the index only retrieves candidates and an LLM decides.
   relation `description`. The known inverse of a type is never offered as its candidate, so this holds in code and
   not only in the prompt.
 - Only types used by stored edges get a node.
+- **Direction at extraction.** The extraction prompt may emit an inverse type (`Ron CHILD_OF Arthur`). Code converts it
+  deterministically before the judge, by swapping source and target (`Arthur PARENT_OF Ron`), so stored data is always
+  canonical and no inverse type is ever stored. Symmetric types (`FRIEND_OF`, `SIBLING_OF`, ...) are stored once per
+  pair, within an article and across articles, in the first-seen orientation. The inverse rule still holds for stored
+  data and the judge: stored edges are never re-oriented and an inverse is never merged with its counterpart.
 
 **Query.** `GET /relations/connected/{id}?type=…` resolves the type in this order:
 
@@ -283,12 +288,20 @@ Rules:
    Otherwise prefer a type from the known types list, and invent a new general type only when nothing fits.
    Put the nuance into the relation `description`, not into the type: "father of" is PARENT_OF,
    "best friends" is FRIEND_OF, "uncle of" is RELATIVE_OF.
-6. Use active voice: `source` is the one who acts or holds the role. Never use passive or inverse types
-   such as BULLIED_BY or CHILD_OF; write "Dudley BULLIES Harry" and "Molly PARENT_OF Ron".
+6. Direction: `source` is the one who holds the role or performs the action: PARENT_OF goes from
+   parent to child, GUARDIAN_OF from guardian to ward, WORKS_FOR from employee to employer,
+   KILLED from killer to victim, BULLIES from bully to victim. Text is often written from the
+   other side; then either reorder the pair or use an inverse type, which is converted automatically:
+   CHILD_OF, WARD_OF, EMPLOYS, STUDENT_OF, MENTEE_OF, BULLIED_BY, KILLED_BY, PROTECTED_BY.
+   Examples: "Ronald's father Arthur" -> Arthur PARENT_OF Ronald (or Ronald CHILD_OF Arthur);
+   "his parents were killed by Voldemort" -> Voldemort KILLED <each parent>;
+   "raised by his aunt Petunia" -> Petunia GUARDIAN_OF Harry.
    For symmetric types (SIBLING_OF, MARRIED_TO, RELATIVE_OF, FRIEND_OF, ENEMY_OF, ROMANTIC_PARTNER_OF)
    emit a single relation.
 7. Extract every family relation the text states, even in passing: parents and children, spouses, siblings,
    aunts, uncles and cousins, guardians.
+   Cousins, aunts, uncles, grandparents and in-laws are RELATIVE_OF, never SIBLING_OF; SIBLING_OF is only for
+   brothers and sisters.
 8. Split compound facts into basic relations: "Voldemort killed Harry's parents" becomes KILLED from
    Voldemort to each parent who is a character.
 9. Use WORKS_FOR for a work hierarchy (a teacher who reports to a headmaster WORKS_FOR the headmaster).
@@ -480,7 +493,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
   aliases, but a model that ignores this merges two people.
 - **Only the listed inverses are answered on query.** A paraphrased inverse such as `son of` resolves to nothing.
 - **One judge call per upload is not split.** Very large articles produce one large prompt.
-- **Symmetric relations** (`FRIEND_OF`) are stored in the direction the model emitted them. Queries use
+- **Symmetric relations** (`FRIEND_OF`) are stored once, in the direction first emitted. Queries use
   `direction=any` by default, so this does not affect lookups.
 - **Refresh tokens** are not rotated with revocation (stateless JWT). The `jti` claim is there to add a denylist.
 - The `text` form field is limited to 1 MB by Starlette's multipart parser; upload larger Markdown as a file.

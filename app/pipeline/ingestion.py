@@ -17,7 +17,7 @@ from app.graph.repository import (
 )
 from app.llm.base import LLMClient, LLMError
 from app.llm.schemas import ExtractionResult, ImageAnalysis
-from app.llm.vocabulary import CANONICAL_RELATION_TYPES
+from app.llm.vocabulary import CANONICAL_RELATION_TYPES, SYMMETRIC_RELATION_TYPES
 from app.pipeline.chunking import chunk_text
 from app.pipeline.documents import DocumentError, ParsedDocument, PdfOptions, parse_markdown, parse_pdf
 from app.pipeline.merging import merge_extractions
@@ -224,15 +224,19 @@ class ArticleIngestionService:
 def _build_relations(
     extraction: ExtractionResult, resolved: dict[str, CharacterRecord], type_plan: TypePlan
 ) -> list[RelationRecord]:
-    relations: dict[tuple[str, str, str], RelationRecord] = {}
+    relations: dict[tuple[frozenset[str] | tuple[str, str], str], RelationRecord] = {}
     for relation in extraction.relations:
         source, target = resolved[relation.source], resolved[relation.target]
         # Two extracted names may resolve to one stored character.
         if source.id == target.id:
             continue
         relation_type = type_plan.mapping[relation.type]
+        # A symmetric type has no direction: keep the first-seen orientation and drop the mirrored duplicate.
+        ends = (
+            frozenset({source.id, target.id}) if relation_type in SYMMETRIC_RELATION_TYPES else (source.id, target.id)
+        )
         relations.setdefault(
-            (source.id, target.id, relation_type),
+            (ends, relation_type),
             RelationRecord(
                 source_id=source.id,
                 source_name=source.name,

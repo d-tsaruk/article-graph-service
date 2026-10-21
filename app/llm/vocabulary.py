@@ -10,7 +10,8 @@ SYMMETRIC_RELATION_TYPES = frozenset(
     {"SIBLING_OF", "MARRIED_TO", "RELATIVE_OF", "FRIEND_OF", "ENEMY_OF", "ROMANTIC_PARTNER_OF"}
 )
 
-# Query-side only: `X CHILD_OF Y` is answered as `Y PARENT_OF X`. Stored data is never re-oriented.
+# `X CHILD_OF Y` means `Y PARENT_OF X`. Extraction output is canonicalized with this map by swapping the ends,
+# and queries use it to flip the direction. Stored data is never re-oriented.
 INVERSE_RELATION_TYPES: dict[str, str] = {
     "CHILD_OF": "PARENT_OF",
     "WARD_OF": "GUARDIAN_OF",

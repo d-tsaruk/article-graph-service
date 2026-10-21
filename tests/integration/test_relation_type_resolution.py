@@ -1,8 +1,14 @@
+from collections.abc import AsyncIterator
+
 import neo4j
 import pytest
 from fastapi.testclient import TestClient
+from neo4j import AsyncGraphDatabase
 
+from app.core.config import Settings
+from app.graph.repository import GraphRepository
 from app.llm.vocabulary import CANONICAL_RELATION_TYPES
+from app.pipeline.resolution import RelationTypeResolver
 from tests.factories import HARRY_DESCRIPTION, RON_DESCRIPTION, character, extraction, relation
 from tests.fakes import FakeLLMClient
 
@@ -62,60 +68,109 @@ def test_specific_or_synonym_type_maps_to_canonical(
     assert target in offered(fake_llm)[new]
 
 
+def edges(db: neo4j.Driver) -> set[tuple[str, str, str]]:
+    records, _, _ = db.execute_query(
+        "MATCH (s:Character)-[r:RELATED_TO]->(t:Character) RETURN s.name AS s, r.type AS type, t.name AS t"
+    )
+    return {(r["s"], r["type"], r["t"]) for r in records}
+
+
+def test_opposite_type_reaches_the_judge_but_is_not_merged(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.embedding_overrides = {"divorced from": "married to"}
+    fake_llm.extraction = extraction([HARRY, RON], [relation("Harry Potter", "Ron Weasley", "DIVORCED_FROM")])
+
+    upload_markdown(client, auth_headers)
+
+    assert "MARRIED_TO" in offered(fake_llm)["DIVORCED_FROM"]
+    assert edge_types(db) == {"DIVORCED_FROM"}
+    assert "DIVORCED_FROM" in type_nodes(db)
+
+
 @pytest.mark.parametrize(
-    ("new", "target", "override", "is_offered"),
+    ("new", "stored", "override", "expected"),
     [
-        ("BULLIED_BY", "BULLIES", {"bullied by": "bullies"}, False),  # a known inverse is filtered in code
-        ("CHILD_OF", "PARENT_OF", {"child of": "parent of"}, False),
-        ("DIVORCED_FROM", "MARRIED_TO", {"divorced from": "married to"}, True),  # an opposite reaches the judge
+        ("BULLIED_BY", "BULLIES", {"bullied by": "bullies"}, ("Ron Weasley", "BULLIES", "Harry Potter")),
+        ("CHILD_OF", "PARENT_OF", {"child of": "parent of"}, ("Ron Weasley", "PARENT_OF", "Harry Potter")),
     ],
 )
-def test_inverse_or_opposite_type_is_not_merged(
+def test_inverse_type_is_canonicalized_before_the_judge(
     client: TestClient,
     auth_headers: dict[str, str],
     fake_llm: FakeLLMClient,
     db: neo4j.Driver,
     new: str,
-    target: str,
+    stored: str,
     override: dict[str, str],
-    is_offered: bool,
+    expected: tuple[str, str, str],
 ) -> None:
     fake_llm.embedding_overrides = override
+    fake_llm.same_relation_types = {(new, stored)}  # inert: the canonical type is stored, so the judge is never asked
     fake_llm.extraction = extraction([HARRY, RON], [relation("Harry Potter", "Ron Weasley", new)])
 
     upload_markdown(client, auth_headers)
 
-    if is_offered:
-        assert target in offered(fake_llm)[new]
-    elif fake_llm.relation_type_judge_calls:  # a colliding fake embedding may still offer other types
-        assert target not in offered(fake_llm)[new]
-    assert edge_types(db) == {new}
-    assert new in type_nodes(db)
+    assert edges(db) == {expected}
+    assert new not in type_nodes(db)
+    assert fake_llm.relation_type_judge_calls == []
 
 
-def test_inverse_type_never_merges_even_when_the_judge_says_stored(
+def test_inverse_types_are_canonicalized_end_to_end(
     client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.extraction = extraction(
+        [character("Ron Weasley", RON_DESCRIPTION), character("Arthur Weasley"), character("James Potter"),
+         character("Lord Voldemort", aliases=("Voldemort",))],
+        [
+            relation("Ron Weasley", "Arthur Weasley", "CHILD_OF"),
+            relation("James Potter", "Lord Voldemort", "KILLED_BY"),
+        ],
+    )  # fmt: skip
+
+    upload_markdown(client, auth_headers)
+
+    assert edges(db) == {
+        ("Arthur Weasley", "PARENT_OF", "Ron Weasley"),
+        ("Lord Voldemort", "KILLED", "James Potter"),
+    }
+    assert not {"CHILD_OF", "KILLED_BY"} & (edge_types(db) | type_nodes(db))
+    assert fake_llm.relation_type_judge_calls == []
+
+
+@pytest.fixture
+async def resolver_with_repository(
+    settings: Settings, fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> AsyncIterator[RelationTypeResolver]:
+    driver = AsyncGraphDatabase.driver(
+        settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password.get_secret_value())
+    )
+    try:
+        repository = GraphRepository(driver, settings.neo4j_database, settings.embedding_dimensions)
+        await repository.init_schema()
+        yield RelationTypeResolver(repository, fake_llm, candidate_score=settings.relation_type_candidate_score)
+    finally:
+        await driver.close()
+
+
+async def test_resolver_never_merges_a_direct_inverse_even_when_the_judge_says_stored(
+    resolver_with_repository: RelationTypeResolver, fake_llm: FakeLLMClient
 ) -> None:
     fake_llm.embedding_overrides = {"bullied by": "bullies"}
     fake_llm.same_relation_types = {("BULLIED_BY", "BULLIES")}
-    fake_llm.extraction = extraction([HARRY, RON], [relation("Harry Potter", "Ron Weasley", "BULLIED_BY")])
 
-    upload_markdown(client, auth_headers)
+    plan = await resolver_with_repository.plan(["BULLIED_BY"])
 
-    assert edge_types(db) == {"BULLIED_BY"}
+    assert plan.mapping == {"BULLIED_BY": "BULLIED_BY"}
     assert fake_llm.relation_type_judge_calls == []  # the inverse was never offered
 
 
-def test_inverse_type_is_not_offered_but_other_candidates_are(
-    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+async def test_resolver_does_not_offer_an_inverse_but_offers_other_candidates(
+    resolver_with_repository: RelationTypeResolver, fake_llm: FakeLLMClient
 ) -> None:
     fake_llm.embedding_overrides = {"bullied by": "bullies", "pals with": "friend of"}
-    fake_llm.extraction = extraction(
-        [HARRY, RON],
-        [relation("Harry Potter", "Ron Weasley", "BULLIED_BY"), relation("Ron Weasley", "Harry Potter", "PALS_WITH")],
-    )
 
-    upload_markdown(client, auth_headers)
+    await resolver_with_repository.plan(["BULLIED_BY", "PALS_WITH"])
 
     candidates = offered(fake_llm)
     assert "BULLIES" not in candidates["BULLIED_BY"]

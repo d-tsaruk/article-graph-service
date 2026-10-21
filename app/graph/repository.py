@@ -6,6 +6,8 @@ import neo4j
 from neo4j import AsyncDriver, RoutingControl
 from neo4j.exceptions import ConstraintError
 
+from app.llm.vocabulary import SYMMETRIC_RELATION_TYPES
+
 CHARACTER_VECTOR_INDEX = "character_embedding"
 RELATION_TYPE_VECTOR_INDEX = "relation_type_embedding"
 
@@ -286,17 +288,35 @@ class GraphRepository:
     # Relations
 
     async def upsert_relations(self, article_id: str, relations: list[dict[str, str]]) -> None:
-        await self._write(
-            "UNWIND $relations AS rel "
-            "MATCH (s:Character {id: rel.source_id}), (t:Character {id: rel.target_id}) "
-            "MERGE (s)-[r:RELATED_TO {type: rel.type}]->(t) "
-            "ON CREATE SET r.description = rel.description, r.article_ids = [$article_id], "
-            "  r.created_at = datetime() "
-            "ON MATCH SET r.article_ids = CASE WHEN $article_id IN r.article_ids THEN r.article_ids "
-            "  ELSE r.article_ids + $article_id END",
-            article_id=article_id,
-            relations=relations,
-        )
+        """Symmetric types reuse an edge stored in either direction. A new one is always created source -> target:
+        an undirected MERGE leaves the orientation of the created edge unspecified, so it is not used."""
+        symmetric = [r for r in relations if r["type"] in SYMMETRIC_RELATION_TYPES]
+        directed = [r for r in relations if r["type"] not in SYMMETRIC_RELATION_TYPES]
+        if directed:
+            await self._write(
+                "UNWIND $relations AS rel "
+                "MATCH (s:Character {id: rel.source_id}), (t:Character {id: rel.target_id}) "
+                "MERGE (s)-[r:RELATED_TO {type: rel.type}]->(t) "
+                "ON CREATE SET r.description = rel.description, r.article_ids = [$article_id], "
+                "  r.created_at = datetime() "
+                "ON MATCH SET r.article_ids = CASE WHEN $article_id IN r.article_ids THEN r.article_ids "
+                "  ELSE r.article_ids + $article_id END",
+                article_id=article_id,
+                relations=directed,
+            )
+        if symmetric:
+            await self._write(
+                "UNWIND $relations AS rel "
+                "MATCH (s:Character {id: rel.source_id}), (t:Character {id: rel.target_id}) "
+                "OPTIONAL MATCH (s)-[r:RELATED_TO {type: rel.type}]-(t) "
+                "FOREACH (_ IN CASE WHEN r IS NULL THEN [1] ELSE [] END | "
+                "  CREATE (s)-[:RELATED_TO {type: rel.type, description: rel.description, "
+                "    article_ids: [$article_id], created_at: datetime()}]->(t)) "
+                "FOREACH (_ IN CASE WHEN r IS NOT NULL AND NOT $article_id IN r.article_ids THEN [1] ELSE [] END | "
+                "  SET r.article_ids = r.article_ids + $article_id)",
+                article_id=article_id,
+                relations=symmetric,
+            )
 
     async def list_relation_types(self) -> list[tuple[str, int]]:
         records = await self._read(

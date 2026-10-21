@@ -23,12 +23,20 @@ Rules:
    Otherwise prefer a type from the known types list, and invent a new general type only when nothing fits.
    Put the nuance into the relation `description`, not into the type: "father of" is PARENT_OF,
    "best friends" is FRIEND_OF, "uncle of" is RELATIVE_OF.
-6. Use active voice: `source` is the one who acts or holds the role. Never use passive or inverse types
-   such as BULLIED_BY or CHILD_OF; write "Dudley BULLIES Harry" and "Molly PARENT_OF Ron".
+6. Direction: `source` is the one who holds the role or performs the action: PARENT_OF goes from
+   parent to child, GUARDIAN_OF from guardian to ward, WORKS_FOR from employee to employer,
+   KILLED from killer to victim, BULLIES from bully to victim. Text is often written from the
+   other side; then either reorder the pair or use an inverse type, which is converted automatically:
+   CHILD_OF, WARD_OF, EMPLOYS, STUDENT_OF, MENTEE_OF, BULLIED_BY, KILLED_BY, PROTECTED_BY.
+   Examples: "Ronald's father Arthur" -> Arthur PARENT_OF Ronald (or Ronald CHILD_OF Arthur);
+   "his parents were killed by Voldemort" -> Voldemort KILLED <each parent>;
+   "raised by his aunt Petunia" -> Petunia GUARDIAN_OF Harry.
    For symmetric types (SIBLING_OF, MARRIED_TO, RELATIVE_OF, FRIEND_OF, ENEMY_OF, ROMANTIC_PARTNER_OF)
    emit a single relation.
 7. Extract every family relation the text states, even in passing: parents and children, spouses, siblings,
    aunts, uncles and cousins, guardians.
+   Cousins, aunts, uncles, grandparents and in-laws are RELATIVE_OF, never SIBLING_OF; SIBLING_OF is only for
+   brothers and sisters.
 8. Split compound facts into basic relations: "Voldemort killed Harry's parents" becomes KILLED from
    Voldemort to each parent who is a character.
 9. Use WORKS_FOR for a work hierarchy (a teacher who reports to a headmaster WORKS_FOR the headmaster).

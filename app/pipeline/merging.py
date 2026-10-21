@@ -2,6 +2,7 @@ import logging
 from dataclasses import dataclass, field
 
 from app.llm.schemas import ExtractedCharacter, ExtractedRelation, ExtractionResult
+from app.llm.vocabulary import INVERSE_RELATION_TYPES
 from app.pipeline.normalization import name_key, normalize_relation_type
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,9 @@ def merge_extractions(results: list[ExtractionResult]) -> ExtractionResult:
             except ValueError:
                 logger.info("Dropping relation with empty type: %s", relation)
                 continue
+            if relation_type in INVERSE_RELATION_TYPES:
+                source, target = target, source
+                relation_type = INVERSE_RELATION_TYPES[relation_type]
             relations.setdefault(
                 (source, target, relation_type),
                 ExtractedRelation(

@@ -1,3 +1,5 @@
+import pytest
+
 from app.pipeline.merging import merge_extractions
 from tests.factories import character, extraction, relation
 
@@ -62,20 +64,52 @@ def test_relations_to_unknown_characters_and_self_loops_are_dropped() -> None:
     assert merged.relations == []
 
 
-def test_relation_direction_is_preserved() -> None:
+def _triples(merged) -> list[tuple[str, str, str, str]]:
+    return [(r.source, r.type, r.target, r.description) for r in merged.relations]
+
+
+@pytest.mark.parametrize(
+    ("people", "extracted", "expected"),
+    [
+        (("Ron", "Arthur"), ("Ron", "Arthur", "CHILD_OF"), ("Arthur", "PARENT_OF", "Ron")),
+        (("James", "Lord Voldemort"), ("James", "Lord Voldemort", "KILLED_BY"), ("Lord Voldemort", "KILLED", "James")),
+        (("Harry", "Dudley"), ("Harry", "Dudley", "BULLIED_BY"), ("Dudley", "BULLIES", "Harry")),
+        (("Harry", "Petunia"), ("Harry", "Petunia", "WARD_OF"), ("Petunia", "GUARDIAN_OF", "Harry")),
+    ],
+)
+def test_inverse_relation_is_canonicalized(people, extracted, expected) -> None:
+    merged = merge_extractions([extraction([character(n) for n in people], [relation(*extracted)])])
+
+    assert [(r.source, r.type, r.target) for r in merged.relations] == [expected]
+
+
+def test_inverse_and_canonical_forms_of_one_fact_collapse_keeping_the_first_description() -> None:
     merged = merge_extractions(
         [
             extraction(
-                [character("Arthur Weasley"), character("Ron Weasley")],
+                [character("Arthur"), character("Ron")],
                 [
-                    relation("Arthur Weasley", "Ron Weasley", "PARENT_OF"),
-                    relation("Ron Weasley", "Arthur Weasley", "CHILD_OF"),
+                    relation("Ron", "Arthur", "CHILD_OF", "Youngest son"),
+                    relation("Arthur", "Ron", "PARENT_OF", "Father"),
                 ],
             )
         ]
     )
 
-    assert {(r.source, r.type, r.target) for r in merged.relations} == {
-        ("Arthur Weasley", "PARENT_OF", "Ron Weasley"),
-        ("Ron Weasley", "CHILD_OF", "Arthur Weasley"),
-    }
+    assert _triples(merged) == [("Arthur", "PARENT_OF", "Ron", "Youngest son")]
+
+
+def test_other_types_keep_their_direction() -> None:
+    merged = merge_extractions(
+        [
+            extraction(
+                [character("Arthur"), character("Ron"), character("Harry")],
+                [relation("Arthur", "Ron", "PARENT_OF"), relation("Ron", "Harry", "FRIEND_OF")],
+            )
+        ]
+    )
+
+    assert [(r.source, r.type, r.target) for r in merged.relations] == [
+        ("Arthur", "PARENT_OF", "Ron"),
+        ("Ron", "FRIEND_OF", "Harry"),
+    ]
