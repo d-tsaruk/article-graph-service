@@ -1,0 +1,24 @@
+[project]
+name = "article-graph-service"
+version = "0.1.0"
+description = "FastAPI microservice that extracts characters and their relations from articles into a graph database"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+asyncio_mode = "auto"
+markers = [
+    "integration: tests that require a running Neo4j (started via testcontainers)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:testcontainers.*",
+    "ignore:builtin type .* has no __module__ attribute:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "ASYNC"]

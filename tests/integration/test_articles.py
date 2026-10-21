@@ -1,0 +1,244 @@
+import neo4j
+from fastapi.testclient import TestClient
+
+from app.llm.schemas import ImageAnalysis
+from tests.factories import (
+    HARRY_DESCRIPTION,
+    HERMIONE_DESCRIPTION,
+    RON_DESCRIPTION,
+    build_pdf,
+    character,
+    extraction,
+    harry_and_ron,
+    relation,
+)
+from tests.fakes import FakeLLMClient
+
+MARKDOWN = "# Chapter One\n\nHarry Potter met Ron Weasley on the Hogwarts Express."
+
+
+def upload_markdown(client: TestClient, headers: dict[str, str], text: str = MARKDOWN) -> dict:
+    response = client.post("/articles/upload", data={"text": text}, headers=headers)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_markdown_upload_persists_article_characters_and_relations(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.extraction = harry_and_ron()
+
+    body = upload_markdown(client, auth_headers)
+
+    assert body["title"] == "Chapter One"
+    assert body["source_type"] == "markdown"
+    assert body["duplicate"] is False
+    assert {c["name"] for c in body["characters"]} == {"Harry Potter", "Ron Weasley"}
+    assert [(r["source_name"], r["type"], r["target_name"]) for r in body["relations"]] == [
+        ("Harry Potter", "FRIEND_OF", "Ron Weasley")
+    ]
+
+    records, _, _ = db.execute_query(
+        "MATCH (a:Article {id: $id})-[:MENTIONS]->(c:Character) RETURN c.name AS name, c.embedding AS e",
+        id=body["article_id"],
+    )
+    assert {r["name"] for r in records} == {"Harry Potter", "Ron Weasley"}
+    assert all(len(r["e"]) == fake_llm.embedding_dimensions for r in records)
+
+    records, _, _ = db.execute_query(
+        "MATCH (s:Character)-[r:RELATED_TO]->(t:Character) "
+        "RETURN s.name AS s, r.type AS type, t.name AS t, r.article_ids AS articles"
+    )
+    assert [(r["s"], r["type"], r["t"], r["articles"]) for r in records] == [
+        ("Harry Potter", "FRIEND_OF", "Ron Weasley", [body["article_id"]])
+    ]
+
+    records, _, _ = db.execute_query("MATCH (t:RelationType) RETURN t.name AS name")
+    assert [r["name"] for r in records] == ["FRIEND_OF"]
+
+
+def test_markdown_file_upload(client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient) -> None:
+    fake_llm.extraction = harry_and_ron()
+
+    response = client.post(
+        "/articles/upload",
+        files={"file": ("chapter.md", MARKDOWN.encode(), "text/markdown")},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["source_type"] == "markdown"
+    assert fake_llm.extract_calls[0][0].startswith("# Chapter One")
+
+
+def test_pdf_upload_sends_images_to_vision_model_and_uses_descriptions(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.image_analysis = ImageAnalysis(
+        is_relevant=True, description="Family tree showing Hermione Granger as a friend of Harry Potter."
+    )
+    fake_llm.extraction = extraction(
+        [character("Harry Potter", HARRY_DESCRIPTION), character("Hermione Granger", HERMIONE_DESCRIPTION)],
+        [relation("Hermione Granger", "Harry Potter", "FRIEND_OF")],
+    )
+    pdf = build_pdf([{"text": "Harry Potter went to Hogwarts.", "image_size": (300, 300)}])
+
+    response = client.post(
+        "/articles/upload", files={"file": ("book.pdf", pdf, "application/pdf")}, headers=auth_headers
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["source_type"] == "pdf"
+    assert len(fake_llm.image_calls) == 1
+    extracted_text = fake_llm.extract_calls[0][0]
+    assert "Harry Potter went to Hogwarts." in extracted_text
+    assert "Family tree showing Hermione Granger" in extracted_text
+    records, _, _ = db.execute_query("MATCH (c:Character) RETURN c.name AS name ORDER BY name")
+    assert [r["name"] for r in records] == ["Harry Potter", "Hermione Granger"]
+
+
+def test_irrelevant_images_are_not_added_to_text(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    fake_llm.image_analysis = ImageAnalysis(is_relevant=False, description="A decorative border.")
+    pdf = build_pdf([{"text": "Some text.", "image_size": (300, 300)}])
+
+    client.post("/articles/upload", files={"file": ("a.pdf", pdf, "application/pdf")}, headers=auth_headers)
+
+    assert "decorative border" not in fake_llm.extract_calls[0][0]
+
+
+def test_same_content_uploaded_twice_is_not_processed_again(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    fake_llm.extraction = harry_and_ron()
+    first = upload_markdown(client, auth_headers)
+
+    response = client.post("/articles/upload", data={"text": MARKDOWN}, headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["duplicate"] is True
+    assert body["article_id"] == first["article_id"]
+    assert {c["name"] for c in body["characters"]} == {"Harry Potter", "Ron Weasley"}
+    assert len(body["relations"]) == 1
+    assert len(fake_llm.extract_calls) == 1
+
+
+def test_characters_are_deduplicated_across_articles_by_alias(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.extraction = harry_and_ron()
+    upload_markdown(client, auth_headers)
+    fake_llm.extraction = extraction(
+        [character("Harry", "The boy with the scar"), character("Ron", "Loyal friend")],
+        [relation("Ron", "Harry", "FRIEND_OF")],
+    )
+
+    upload_markdown(client, auth_headers, text="Ron and Harry played chess.")
+
+    records, _, _ = db.execute_query(
+        "MATCH (c:Character) OPTIONAL MATCH (a:Article)-[:MENTIONS]->(c) "
+        "RETURN c.name AS name, count(a) AS articles ORDER BY name"
+    )
+    assert [(r["name"], r["articles"]) for r in records] == [("Harry Potter", 2), ("Ron Weasley", 2)]
+
+
+def test_characters_are_deduplicated_across_articles_by_vector_similarity(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.extraction = extraction([character("Harry Potter", HARRY_DESCRIPTION)])
+    upload_markdown(client, auth_headers)
+    fake_llm.extraction = extraction(
+        [character("Mr. Potter", HARRY_DESCRIPTION), character("Ronald Weasley", RON_DESCRIPTION)]
+    )
+
+    upload_markdown(client, auth_headers, text="Mr. Potter and Ronald Weasley.")
+
+    records, _, _ = db.execute_query("MATCH (c:Character) RETURN c.name AS name, c.aliases AS aliases")
+    by_name = {r["name"]: r["aliases"] for r in records}
+    assert set(by_name) == {"Harry Potter", "Ronald Weasley"}
+    assert "Mr. Potter" in by_name["Harry Potter"]
+
+
+def test_relation_types_are_deduplicated_by_vector_similarity(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.embedding_overrides = {"friends with": "friend of"}
+    fake_llm.extraction = harry_and_ron()
+    upload_markdown(client, auth_headers)
+    fake_llm.extraction = extraction(
+        [character("Harry Potter", HARRY_DESCRIPTION), character("Hermione Granger", HERMIONE_DESCRIPTION)],
+        [relation("Harry Potter", "Hermione Granger", "friends with")],
+    )
+
+    upload_markdown(client, auth_headers, text="Harry and Hermione.")
+
+    records, _, _ = db.execute_query("MATCH ()-[r:RELATED_TO]->() RETURN DISTINCT r.type AS type")
+    assert [r["type"] for r in records] == ["FRIEND_OF"]
+    assert fake_llm.extract_calls[1][1] == ["FRIEND_OF"]
+
+
+def test_relations_with_unknown_characters_or_self_loops_are_dropped(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.extraction = extraction(
+        [character("Harry Potter", HARRY_DESCRIPTION, aliases=("Harry",))],
+        [relation("Harry Potter", "Voldemort", "ENEMY_OF"), relation("Harry Potter", "Harry", "SELF")],
+    )
+
+    body = upload_markdown(client, auth_headers)
+
+    assert body["relations"] == []
+    records, _, _ = db.execute_query("MATCH ()-[r:RELATED_TO]->() RETURN count(r) AS n")
+    assert records[0]["n"] == 0
+
+
+def test_upload_without_content_is_rejected(client: TestClient, auth_headers: dict[str, str]) -> None:
+    response = client.post("/articles/upload", headers=auth_headers)
+
+    assert response.status_code == 422
+
+
+def test_upload_with_both_text_and_file_is_rejected(client: TestClient, auth_headers: dict[str, str]) -> None:
+    response = client.post(
+        "/articles/upload",
+        data={"text": MARKDOWN},
+        files={"file": ("a.md", b"# x", "text/markdown")},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+
+
+def test_unsupported_file_type_is_rejected(client: TestClient, auth_headers: dict[str, str]) -> None:
+    response = client.post(
+        "/articles/upload", files={"file": ("a.docx", b"PK\x03\x04", "application/msword")}, headers=auth_headers
+    )
+
+    assert response.status_code == 415
+
+
+def test_corrupted_pdf_is_rejected(client: TestClient, auth_headers: dict[str, str]) -> None:
+    response = client.post(
+        "/articles/upload", files={"file": ("a.pdf", b"%PDF-1.7 garbage", "application/pdf")}, headers=auth_headers
+    )
+
+    assert response.status_code == 422
+
+
+def test_failed_extraction_leaves_no_article(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    from app.llm.base import LLMError
+
+    def fail(_: str):
+        raise LLMError("model refused")
+
+    fake_llm.extraction = fail
+
+    response = client.post("/articles/upload", data={"text": MARKDOWN}, headers=auth_headers)
+
+    assert response.status_code == 502
+    records, _, _ = db.execute_query("MATCH (a:Article) RETURN count(a) AS n")
+    assert records[0]["n"] == 0
