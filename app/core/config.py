@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     openai_api_key: SecretStr | None = None
     openai_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "gpt-4.1-mini"
     vision_model: str = "gpt-4o-mini"
     judge_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"

@@ -30,7 +30,7 @@ until `OPENAI_API_KEY` is set. Neo4j Browser is available at http://localhost:74
                    │                   ├─ 2. LLM vision: describe images & rendered pages   │
                    │                   ├─ 3. chunking.chunk_text (paragraph packing+overlap)│
                    │                   ├─ 4. LLM extraction per chunk (Structured Outputs)  │
-                   │                   ├─ 5. merging.merge_extractions (union-find)         │
+                   │                   ├─ 5. merging.merge_extractions (name-anchored)      │
                    │                   ├─ 6. resolution: vector/name candidates → LLM judge │
                    │                   └─ 7. graph/repository: persist                      │
                    └───────────────┬───────────────────────────────┬────────────────────────┘
@@ -66,9 +66,12 @@ until `OPENAI_API_KEY` is set. Neo4j Browser is available at http://localhost:74
    Structured Outputs (`chat.completions.parse` with a Pydantic `response_format`, strict JSON schema), so the
    response is validated before the pipeline sees it. Refusals, truncation and API errors become `502`. The
    canonical relation vocabulary and the types already used in the graph are passed as preferred types.
-6. **In-article merge.** Characters from all chunks are unified with union-find over normalized names and aliases.
+6. **In-article merge.** Characters from all chunks are merged only when the normalized name of one equals the name
+   or an alias of the other (name-anchored). Two characters that merely share an alias are not merged here: the
+   character judge decides that in step 7. Aliases that are possessive descriptors ("Ronald's father") are dropped.
    Relations are rewritten to canonical names, typed (`UPPER_SNAKE_CASE`) and deduplicated. Relations that point to
-   unknown characters, and self-loops, are dropped.
+   unknown characters, that go through an alias claimed by two or more unmerged characters (ambiguous), and
+   self-loops, are dropped.
 7. **Resolution against the graph** (see [Deduplication](#deduplication-and-the-vector-index)). Only reads and LLM
    calls, no writes, except the idempotent seed of the relation-type vocabulary.
 8. **Persistence.** The article is created as `processing`. Characters, mentions and relations are written, then
@@ -275,6 +278,8 @@ Rules:
    and list every other way the text refers to them in `aliases` (first names, nicknames, titles with surnames).
    Do not list pronouns or generic descriptions ("the boy") as aliases. Never list an alias that the text
    also uses for another character, such as a bare family surname.
+   An alias is another name for the same character, never a description of a relation such as "Ronald's father"
+   or "Harry's aunt"; such phrases belong to other characters or to relations.
 3. `description` is one or two sentences describing who the character is according to the text.
 4. Extract relations only between characters from your `characters` list; `source` and `target` must be
    exactly their `name` values. Never relate a character to itself.
@@ -444,7 +449,8 @@ All settings are environment variables (see [`app/core/config.py`](app/core/conf
 | `JWT_SECRET` | — (compose: dev value) | ≥ 32 chars |
 | `ACCESS_TOKEN_TTL_SECONDS` / `REFRESH_TOKEN_TTL_SECONDS` | 900 / 86400 | |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | — | any OpenAI-compatible backend |
-| `LLM_MODEL` / `VISION_MODEL` | `gpt-4o-mini` | must support Structured Outputs; the vision model must accept images |
+| `LLM_MODEL` | `gpt-4.1-mini` | extraction model; must support Structured Outputs |
+| `VISION_MODEL` | `gpt-4o-mini` | must accept images |
 | `JUDGE_MODEL` | `gpt-4o-mini` | must support Structured Outputs |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | `text-embedding-3-small` / 1536 | changing the dimension requires a fresh database (the vector index is created with it) |
 | `LLM_CONCURRENCY` | 4 | parallel LLM calls per process |
@@ -455,6 +461,10 @@ All settings are environment variables (see [`app/core/config.py`](app/core/conf
 | `API_PORT` / `NEO4J_HTTP_PORT` / `NEO4J_BOLT_PORT` | 8000 / 7474 / 7687 | host ports (compose) |
 
 Stronger models (e.g. `gpt-4o`) for `LLM_MODEL` and `JUDGE_MODEL` improve extraction and dedup quality at a higher cost.
+
+**Model choice.** `LLM_MODEL` defaults to `gpt-4.1-mini`. In an experiment of 2 runs per model over the two sample
+articles, `gpt-4o-mini` inverted 4 to 6 relation edges (for example child and parent swapped) and `gpt-4.1-mini`
+inverted none, at similar token counts. This is a small sample, so treat it as an indication, not a benchmark.
 
 ## Tests
 
@@ -489,8 +499,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 - **Recall is bounded by the candidate channels.** An alias with no shared name token that ranks outside the vector
   top-k is never judged, and becomes a duplicate.
 - **Existing data is not re-resolved.** Earlier wrong merges or types stay until re-ingested into a fresh database.
-- **In-article merging** (union-find over names and aliases) does not use the judge. The prompt forbids shared-surname
-  aliases, but a model that ignores this merges two people.
+- **In-article merging** is name-anchored and does not use the judge. Characters sharing only an alias stay separate
+  and are left to the character judge; a relation that names such an ambiguous alias is dropped rather than guessed.
+  Possessive descriptor aliases ("Ronald's father") are dropped, which would also drop a legitimate alias containing
+  `'s` (rare for names; logged at INFO).
 - **Only the listed inverses are answered on query.** A paraphrased inverse such as `son of` resolves to nothing.
 - **One judge call per upload is not split.** Very large articles produce one large prompt.
 - **Symmetric relations** (`FRIEND_OF`) are stored once, in the direction first emitted. Queries use

@@ -10,6 +10,8 @@ Rules:
    and list every other way the text refers to them in `aliases` (first names, nicknames, titles with surnames).
    Do not list pronouns or generic descriptions ("the boy") as aliases. Never list an alias that the text
    also uses for another character, such as a bare family surname.
+   An alias is another name for the same character, never a description of a relation such as "Ronald's father"
+   or "Harry's aunt"; such phrases belong to other characters or to relations.
 3. `description` is one or two sentences describing who the character is according to the text.
 4. Extract relations only between characters from your `characters` list; `source` and `target` must be
    exactly their `name` values. Never relate a character to itself.

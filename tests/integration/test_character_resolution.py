@@ -117,6 +117,33 @@ def test_in_article_duplicates_merge(
     assert [(r["name"], r["aliases"]) for r in records] == [("Ron Weasley", ["Ronald"])]
 
 
+def test_in_article_alias_only_overlap_is_decided_by_the_judge(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.same_characters = [{"Tom Riddle", "Lord Voldemort"}]
+
+    upload(
+        client,
+        auth_headers,
+        fake_llm,
+        [
+            character("Tom Riddle", "A Hogwarts student", aliases=("Voldemort",)),
+            character("Lord Voldemort", "A dark wizard", aliases=("Voldemort", "You-Know-Who")),
+        ],
+        text="one article",
+    )
+
+    new, _ = fake_llm.character_judge_calls[-1]
+    assert {card.name: set(card.aliases) for card in new} == {
+        "Tom Riddle": {"Voldemort"},
+        "Lord Voldemort": {"Voldemort", "You-Know-Who"},
+    }
+    records, _, _ = db.execute_query("MATCH (c:Character) RETURN c.name AS name, c.aliases AS aliases")
+    assert [(r["name"], set(r["aliases"])) for r in records] == [
+        ("Tom Riddle", {"Voldemort", "Lord Voldemort", "You-Know-Who"})
+    ]
+
+
 def test_alias_collision_goes_to_judge(
     client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
 ) -> None:

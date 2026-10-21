@@ -66,3 +66,11 @@ def test_old_score_settings_are_ignored(monkeypatch: pytest.MonkeyPatch, name: s
     settings = make()
 
     assert not hasattr(settings, name.lower())
+
+
+def test_model_defaults() -> None:
+    settings = make()
+
+    assert settings.llm_model == "gpt-4.1-mini"
+    assert settings.vision_model == "gpt-4o-mini"
+    assert settings.judge_model == "gpt-4o-mini"

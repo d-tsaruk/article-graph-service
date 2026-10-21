@@ -32,7 +32,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-local-dev-jwt-secret-change-me-0123456789}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4.1-mini}
       VISION_MODEL: ${VISION_MODEL:-gpt-4o-mini}
       JUDGE_MODEL: ${JUDGE_MODEL:-gpt-4o-mini}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}

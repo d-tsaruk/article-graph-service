@@ -1,4 +1,5 @@
 import logging
+import re
 from dataclasses import dataclass, field
 
 from app.llm.schemas import ExtractedCharacter, ExtractedRelation, ExtractionResult
@@ -8,6 +9,7 @@ from app.pipeline.normalization import name_key, normalize_relation_type
 logger = logging.getLogger(__name__)
 
 MAX_DESCRIPTION_CHARS = 1000
+POSSESSIVE = re.compile(r"['’]s\b")
 
 
 @dataclass
@@ -39,13 +41,46 @@ class _Group:
         return ExtractedCharacter(name=self.name, aliases=aliases, description=description)
 
 
-class _CharacterIndex:
-    """Union-find over name keys: entries sharing any name or alias end up in one group."""
+def _clean_aliases(character: ExtractedCharacter) -> list[tuple[str, str]]:
+    """(spelling, key) pairs of the usable aliases: no possessive descriptors, no echo of the name."""
+    name_k = name_key(character.name)
+    aliases = []
+    for alias in character.aliases:
+        if POSSESSIVE.search(alias):
+            logger.info("Dropping possessive descriptor alias %r of %r", alias, character.name)
+        elif (alias_k := name_key(alias)) and alias_k != name_k:
+            aliases.append((alias, alias_k))
+    return aliases
 
-    def __init__(self) -> None:
+
+class _CharacterIndex:
+    """Groups characters anchored on names.
+
+    Two entries are unioned only when the name of one equals the name or an alias of the other. An alias shared
+    only alias-to-alias ("Voldemort" for both Tom Riddle and Lord Voldemort) never unions: that call is left to
+    the judge, because models also emit descriptors such as "Ronald's father" as aliases of the wrong person.
+    An alias held by characters with different names is ambiguous for the whole article, so it neither unions
+    nor resolves a relation, whatever the order the characters arrive in.
+    """
+
+    def __init__(self, characters: list[ExtractedCharacter]) -> None:
         self._groups: list[_Group] = []
         self._parent: list[int] = []
-        self._by_key: dict[str, int] = {}
+        self._by_name_key: dict[str, int] = {}
+        self._by_alias_key: dict[str, set[int]] = {}
+        holders: dict[str, set[str]] = {}
+        self._cleaned = []
+        for character in characters:
+            name_k = name_key(character.name)
+            if not name_k:
+                continue
+            aliases = _clean_aliases(character)
+            self._cleaned.append((character, name_k, aliases))
+            for _, alias_k in aliases:
+                holders.setdefault(alias_k, set()).add(name_k)
+        self._ambiguous = {key for key, names in holders.items() if len(names) > 1}
+        for character, name_k, aliases in self._cleaned:
+            self._add(character, name_k, aliases)
 
     def _find(self, index: int) -> int:
         while self._parent[index] != index:
@@ -53,15 +88,20 @@ class _CharacterIndex:
             index = self._parent[index]
         return index
 
-    def add(self, character: ExtractedCharacter) -> None:
-        keys = {name_key(n) for n in (character.name, *character.aliases)} - {""}
-        if not keys:
-            return
-        roots = sorted({self._find(self._by_key[k]) for k in keys if k in self._by_key})
-        if roots:
+    def _add(self, character: ExtractedCharacter, name_k: str, aliases: list[tuple[str, str]]) -> None:
+        matched = set()
+        if name_k in self._by_name_key:
+            matched.add(self._find(self._by_name_key[name_k]))
+        if name_k not in self._ambiguous:
+            matched.update(self._alias_roots(name_k))
+        for _, alias_k in aliases:
+            if alias_k in self._by_name_key and alias_k not in self._ambiguous:
+                matched.add(self._find(self._by_name_key[alias_k]))
+
+        if matched:
             # The earliest group wins so the canonical name is the first one the model produced.
-            target = roots[0]
-            for other in roots[1:]:
+            target = min(matched)
+            for other in matched - {target}:
                 self._groups[target].absorb(self._groups[other])
                 self._parent[other] = target
         else:
@@ -70,15 +110,29 @@ class _CharacterIndex:
             self._parent.append(target)
 
         group = self._groups[target]
-        for name in (character.name, *character.aliases):
-            group.add_name(name)
+        group.add_name(character.name)
+        for alias, _ in aliases:
+            group.add_name(alias)
         group.add_description(character.description)
-        for key in keys:
-            self._by_key[key] = target
+        self._by_name_key[name_k] = target
+        for _, alias_k in aliases:
+            self._by_alias_key.setdefault(alias_k, set()).add(target)
+
+    def _alias_roots(self, key: str) -> set[int]:
+        return {self._find(i) for i in self._by_alias_key.get(key, ())}
 
     def canonical_name(self, name: str) -> str | None:
-        index = self._by_key.get(name_key(name))
-        return None if index is None else self._groups[self._find(index)].name
+        key = name_key(name)
+        if key in self._by_name_key:
+            return self._groups[self._find(self._by_name_key[key])].name
+        roots = self._alias_roots(key)
+        if key in self._ambiguous or len(roots) != 1:
+            return None
+        return self._groups[roots.pop()].name
+
+    def is_ambiguous(self, name: str) -> bool:
+        key = name_key(name)
+        return key not in self._by_name_key and key in self._ambiguous
 
     def characters(self) -> list[ExtractedCharacter]:
         return [group.to_character() for i, group in enumerate(self._groups) if self._find(i) == i]
@@ -86,10 +140,7 @@ class _CharacterIndex:
 
 def merge_extractions(results: list[ExtractionResult]) -> ExtractionResult:
     """Combines per-chunk extractions of one article into a single consistent result."""
-    index = _CharacterIndex()
-    for result in results:
-        for character in result.characters:
-            index.add(character)
+    index = _CharacterIndex([character for result in results for character in result.characters])
 
     relations: dict[tuple[str, str, str], ExtractedRelation] = {}
     for result in results:
@@ -97,7 +148,11 @@ def merge_extractions(results: list[ExtractionResult]) -> ExtractionResult:
             source = index.canonical_name(relation.source)
             target = index.canonical_name(relation.target)
             if source is None or target is None:
-                logger.info("Dropping relation to unknown character: %s", relation)
+                ambiguous = [n for n in (relation.source, relation.target) if index.is_ambiguous(n)]
+                if ambiguous:
+                    logger.info("Dropping relation through ambiguous alias %r: %s", ambiguous[0], relation)
+                else:
+                    logger.info("Dropping relation to unknown character: %s", relation)
                 continue
             if source == target:
                 continue
