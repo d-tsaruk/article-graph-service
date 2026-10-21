@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 LEXICAL_CANDIDATES = 10
 RELATION_TYPE_CANDIDATES = 5
+# The vector index is approximate and `k` is also its search width: asking for more than we keep improves recall.
+RELATION_TYPE_SEARCH_WIDTH = 4 * RELATION_TYPE_CANDIDATES
 
 
 def character_embedding_text(character: ExtractedCharacter) -> str:
@@ -282,9 +284,10 @@ class RelationTypeResolver:
 
     async def _candidates(self, embedding: list[float], *, exclude_inverse_of: str) -> list[str]:
         """An inverse is never a match candidate (spec D7), whatever the judge would say."""
-        matches = await self._repository.find_similar_relation_types(embedding, RELATION_TYPE_CANDIDATES)
-        return [
+        matches = await self._repository.find_similar_relation_types(embedding, RELATION_TYPE_SEARCH_WIDTH)
+        names = [
             match.name
             for match in matches
             if match.score >= self._candidate_score and not _are_inverse(exclude_inverse_of, match.name)
         ]
+        return names[:RELATION_TYPE_CANDIDATES]
