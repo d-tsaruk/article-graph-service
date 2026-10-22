@@ -1,16 +1,20 @@
 import neo4j
 from fastapi.testclient import TestClient
 
-from app.llm.base import LLMError
+from app.core.config import Settings
+from app.llm.base import UnconfiguredLLMClient
+from app.main import create_app
 from tests.factories import (
     HARRY_DESCRIPTION,
     HERMIONE_DESCRIPTION,
     RON_DESCRIPTION,
     character,
     extraction,
+    insert_character,
     relation,
 )
 from tests.fakes import FakeLLMClient
+from tests.integration.conftest import APP_TOKEN
 
 
 def seed(client: TestClient, headers: dict[str, str], fake_llm: FakeLLMClient) -> dict[str, dict]:
@@ -90,7 +94,7 @@ def test_connected_characters_in_any_direction(
     assert body["resolved_type"] == "FRIEND_OF"
     assert {(c["character"]["name"], c["direction"]) for c in body["connections"]} == {
         ("Ron Weasley", "outgoing"),
-        ("Hermione Granger", "incoming"),
+        ("Hermione Granger", "outgoing"),
     }
 
 
@@ -102,7 +106,7 @@ def test_connected_characters_filtered_by_direction(
 
     response = client.get(f"/relations/connected/{harry_id}?type=FRIEND_OF&direction=incoming", headers=auth_headers)
 
-    assert [c["character"]["name"] for c in response.json()["connections"]] == ["Hermione Granger"]
+    assert {c["character"]["name"] for c in response.json()["connections"]} == {"Ron Weasley", "Hermione Granger"}
 
 
 def test_connected_characters_normalizes_requested_type(
@@ -121,22 +125,6 @@ def test_connected_characters_normalizes_requested_type(
     assert [c["character"]["name"] for c in body["connections"]] == ["Hermione Granger"]
 
 
-def test_connected_characters_resolves_synonym_type_semantically(
-    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
-) -> None:
-    seeded = seed(client, auth_headers, fake_llm)
-    fake_llm.embedding_overrides = {"buddy of": "friend of"}
-    fake_llm.same_relation_types = {("BUDDY_OF", "FRIEND_OF")}
-
-    response = client.get(f"/relations/connected/{seeded['Harry Potter']['id']}?type=BUDDY_OF", headers=auth_headers)
-
-    body = response.json()
-    assert body["requested_type"] == "BUDDY_OF"
-    assert body["resolved_type"] == "FRIEND_OF"
-    assert len(body["connections"]) == 2
-    assert len(fake_llm.relation_type_judge_calls) == 1
-
-
 def test_connected_characters_with_unknown_type_returns_empty_list(
     client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
 ) -> None:
@@ -152,11 +140,15 @@ def test_connected_characters_with_unknown_type_returns_empty_list(
 
 
 def test_connected_characters_for_unknown_character_returns_404(
-    client: TestClient, auth_headers: dict[str, str]
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
 ) -> None:
     response = client.get("/relations/connected/missing?type=FRIEND_OF", headers=auth_headers)
+    unknown_type = client.get("/relations/connected/missing?type=buddy of", headers=auth_headers)
 
     assert response.status_code == 404
+    assert unknown_type.status_code == 404
+    assert fake_llm.embed_calls == []
+    assert fake_llm.relation_type_judge_calls == []
 
 
 def test_connected_characters_inverse_type_uses_canonical_type(
@@ -184,31 +176,6 @@ def test_connected_characters_inverse_type_uses_canonical_type(
     assert fake_llm.relation_type_judge_calls == []
 
 
-def test_connected_characters_type_judge_rejects_candidate(
-    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
-) -> None:
-    seeded = seed(client, auth_headers, fake_llm)
-    fake_llm.embedding_overrides = {"foe of": "friend of"}
-
-    response = client.get(f"/relations/connected/{seeded['Harry Potter']['id']}?type=foe of", headers=auth_headers)
-
-    assert response.status_code == 200
-    assert response.json()["resolved_type"] is None
-    assert response.json()["connections"] == []
-
-
-def test_connected_characters_judge_failure_returns_502(
-    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
-) -> None:
-    seeded = seed(client, auth_headers, fake_llm)
-    fake_llm.embedding_overrides = {"buddy of": "friend of"}
-    fake_llm.judge_error = LLMError("boom")
-
-    response = client.get(f"/relations/connected/{seeded['Harry Potter']['id']}?type=buddy of", headers=auth_headers)
-
-    assert response.status_code == 502
-
-
 def test_inverse_map_wins_over_a_stored_node_of_the_inverse_type(
     client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
 ) -> None:
@@ -226,22 +193,73 @@ def test_inverse_map_wins_over_a_stored_node_of_the_inverse_type(
     assert [c["character"]["name"] for c in response.json()["connections"]] == ["Lily Potter"]
 
 
-def test_embedding_count_mismatch_on_query_returns_502(
-    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
-) -> None:
-    seeded = seed(client, auth_headers, fake_llm)
-
-    async def broken_embed(texts: list[str]) -> list[list[float]]:
-        return []
-
-    fake_llm.embed = broken_embed  # type: ignore[method-assign]
-
-    response = client.get(f"/relations/connected/{seeded['Harry Potter']['id']}?type=buddy of", headers=auth_headers)
-
-    assert response.status_code == 502
-
-
 def test_blank_type_is_still_a_422(client: TestClient, auth_headers: dict[str, str]) -> None:
     response = client.get("/relations/connected/any?type=%21%21", headers=auth_headers)
 
     assert response.status_code == 422
+
+
+def test_unknown_type_makes_no_llm_call(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    seeded = seed(client, auth_headers, fake_llm)
+    embeds, judges = len(fake_llm.embed_calls), len(fake_llm.relation_type_judge_calls)
+
+    response = client.get(f"/relations/connected/{seeded['Harry Potter']['id']}?type=buddy of", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["resolved_type"] is None
+    assert response.json()["connections"] == []
+    assert len(fake_llm.embed_calls) == embeds
+    assert len(fake_llm.relation_type_judge_calls) == judges
+
+
+def test_type_without_of_suffix_is_resolved(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    seeded = seed(client, auth_headers, fake_llm)
+
+    response = client.get(f"/relations/connected/{seeded['Harry Potter']['id']}?type=friend", headers=auth_headers)
+
+    assert response.json()["resolved_type"] == "FRIEND_OF"
+    assert len(response.json()["connections"]) == 2
+
+
+def test_child_without_of_suffix_resolves_through_the_inverse_map(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    fake_llm.extraction = extraction(
+        [character("Lily Potter", "Harry's mother"), character("Harry Potter", HARRY_DESCRIPTION)],
+        [relation("Lily Potter", "Harry Potter", "PARENT_OF")],
+    )
+    body = client.post("/articles/upload", data={"text": "Lily and Harry."}, headers=auth_headers).json()
+    harry = next(c["id"] for c in body["characters"] if c["name"] == "Harry Potter")
+
+    response = client.get(f"/relations/connected/{harry}?type=child", headers=auth_headers)
+
+    assert response.json()["resolved_type"] == "PARENT_OF"
+    assert [c["character"]["name"] for c in response.json()["connections"]] == ["Lily Potter"]
+
+
+def test_query_does_not_write(client: TestClient, auth_headers: dict[str, str], db: neo4j.Driver) -> None:
+    insert_character(db, id="c1", name="Harry Potter")
+
+    response = client.get("/relations/connected/c1?type=buddy of", headers=auth_headers)
+
+    assert response.status_code == 200
+    records, _, _ = db.execute_query("MATCH (t:RelationType) RETURN count(t) AS n")
+    assert records[0]["n"] == 0
+
+
+def test_query_works_without_llm_key(settings: Settings, db: neo4j.Driver) -> None:
+    insert_character(db, id="c1", name="Harry Potter")
+
+    with TestClient(create_app(settings, llm_client=UnconfiguredLLMClient())) as keyless:
+        token = keyless.post("/auth/token", json={"app_token": APP_TOKEN}).json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        query = keyless.get("/relations/connected/c1?type=buddy of", headers=headers)
+        upload = keyless.post("/articles/upload", data={"text": "Some text."}, headers=headers)
+
+    assert query.status_code == 200
+    assert upload.status_code == 503

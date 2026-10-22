@@ -1,9 +1,12 @@
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 
 import pymupdf
+
+from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,20 @@ class PdfOptions:
     render_dpi: int
     scanned_page_max_chars: int
     drawings_render_threshold: int
+    max_pages: int
+    max_render_side_px: int
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "PdfOptions":
+        return cls(
+            max_visual_items=settings.pdf_max_visual_items,
+            min_image_side_px=settings.pdf_min_image_side_px,
+            render_dpi=settings.pdf_render_dpi,
+            scanned_page_max_chars=settings.pdf_scanned_page_max_chars,
+            drawings_render_threshold=settings.pdf_drawings_render_threshold,
+            max_pages=settings.max_pdf_pages,
+            max_render_side_px=settings.pdf_max_render_side_px,
+        )
 
 
 def parse_markdown(text: str) -> ParsedDocument:
@@ -65,6 +82,10 @@ def parse_pdf(data: bytes, options: PdfOptions) -> ParsedDocument:
     with document:
         if document.needs_pass:
             raise DocumentError("encrypted PDFs are not supported")
+        if document.page_count > options.max_pages:
+            raise DocumentError(
+                f"PDF has {document.page_count} pages; the limit is {options.max_pages} (MAX_PDF_PAGES)"
+            )
         try:
             pages = _PdfReader(document, options).read()
         except DocumentError:
@@ -107,7 +128,7 @@ class _PdfReader:
         has_vector_graphics = len(page.get_drawings()) >= self._options.drawings_render_threshold
 
         if is_scanned or has_vector_graphics:
-            pixmap = page.get_pixmap(dpi=self._options.render_dpi)
+            pixmap = page.get_pixmap(matrix=self._render_matrix(page))
             result.visuals.append(Visual(VisualKind.PAGE_RENDER, number, pixmap.tobytes("png"), "image/png"))
             self._budget -= 1
             self._seen_xrefs.update(large_xrefs)
@@ -124,15 +145,27 @@ class _PdfReader:
                 self._budget -= 1
         return result
 
+    def _render_matrix(self, page: pymupdf.Page) -> pymupdf.Matrix:
+        longest_side = max(page.rect.width, page.rect.height)
+        # Floored so that the rounded-up pixel size never exceeds the limit.
+        fit = math.floor(self._options.max_render_side_px / longest_side * 1000) / 1000
+        zoom = min(self._options.render_dpi / 72, fit)
+        return pymupdf.Matrix(zoom, zoom)
+
     def _extract_image(self, xref: int, page_number: int) -> Visual | None:
         info = self._document.extract_image(xref)
         if not info:
             return None
-        if mime_type := _PASSTHROUGH_IMAGE_TYPES.get(info["ext"]):
+        longest = max(info["width"], info["height"])
+        oversized = longest > self._options.max_render_side_px
+        if not oversized and (mime_type := _PASSTHROUGH_IMAGE_TYPES.get(info["ext"])):
             return Visual(VisualKind.EMBEDDED_IMAGE, page_number, info["image"], mime_type)
 
-        # Formats vision APIs do not accept (JPX, JBIG2, CMYK, ...) are re-encoded as RGB PNG.
+        # Oversized images and formats vision APIs do not accept (JPX, JBIG2, CMYK, ...) are re-encoded as PNG.
         pixmap = pymupdf.Pixmap(self._document, xref)
         if pixmap.colorspace and pixmap.colorspace.n > 3:
             pixmap = pymupdf.Pixmap(pymupdf.csRGB, pixmap)
+        if oversized:
+            # shrink(n) divides each side by 2**n.
+            pixmap.shrink(math.ceil(math.log2(longest / self._options.max_render_side_px)))
         return Visual(VisualKind.EMBEDDED_IMAGE, page_number, pixmap.tobytes("png"), "image/png")

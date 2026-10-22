@@ -7,8 +7,9 @@ import openai
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
+from app.core.config import Settings
 from app.llm import prompts
-from app.llm.base import LLMError
+from app.llm.base import LLMError, LLMUnavailableError
 from app.llm.judging import CharacterCard, RelationTypeCard
 from app.llm.schemas import ExtractionResult, ImageAnalysis, Judgement
 
@@ -17,6 +18,13 @@ ResponseT = TypeVar("ResponseT", bound=BaseModel)
 logger = logging.getLogger(__name__)
 
 EMBEDDING_BATCH_SIZE = 256
+_OUTAGES = (
+    openai.APIConnectionError,  # includes APITimeoutError
+    openai.RateLimitError,
+    openai.InternalServerError,
+    openai.AuthenticationError,
+    openai.PermissionDeniedError,
+)
 
 
 def _lines(lines: list[str]) -> str:
@@ -131,6 +139,8 @@ class OpenAILLMClient:
                     response = await self._sdk.embeddings.create(
                         model=self._embedding_model, input=batch, dimensions=self._embedding_dimensions
                     )
+                except _OUTAGES as exc:
+                    raise LLMUnavailableError(f"embedding request failed: {exc}") from exc
                 except openai.OpenAIError as exc:
                     raise LLMError(f"embedding request failed: {exc}") from exc
             vectors.extend(item.embedding for item in sorted(response.data, key=lambda item: item.index))
@@ -146,6 +156,8 @@ class OpenAILLMClient:
                 )
             except openai.LengthFinishReasonError as exc:
                 raise LLMError(f"{model} output was truncated{truncation_hint}") from exc
+            except _OUTAGES as exc:
+                raise LLMUnavailableError(f"{model} request failed: {exc}") from exc
             except openai.OpenAIError as exc:
                 raise LLMError(f"{model} request failed: {exc}") from exc
             except ValidationError as exc:
@@ -163,7 +175,7 @@ class OpenAILLMClient:
         return message.parsed
 
 
-def build_openai_client(settings) -> OpenAILLMClient:
+def build_openai_client(settings: Settings) -> OpenAILLMClient:
     sdk = AsyncOpenAI(
         api_key=settings.openai_api_key.get_secret_value(),
         base_url=settings.openai_base_url,

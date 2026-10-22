@@ -2,13 +2,14 @@ import logging
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import openai
 import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.llm import prompts
-from app.llm.base import LLMError
+from app.llm.base import LLMError, LLMUnavailableError
 from app.llm.judging import CharacterCard, RelationTypeCard
 from app.llm.openai_client import OpenAILLMClient, build_openai_client
 from app.llm.schemas import ExtractionResult, ImageAnalysis, Judgement, Verdict
@@ -251,3 +252,36 @@ def test_build_client_uses_configured_base_url() -> None:
     )
 
     assert str(build_openai_client(settings)._sdk.base_url) == "http://localhost:11434/v1/"
+
+
+def _status_error(cls: type[openai.APIStatusError], status: int) -> openai.APIStatusError:
+    request = httpx.Request("POST", "https://api.example/v1/chat/completions")
+    return cls("boom", response=httpx.Response(status, request=request), body=None)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        openai.APIConnectionError(request=httpx.Request("POST", "https://x")),
+        openai.APITimeoutError(request=httpx.Request("POST", "https://x")),
+        _status_error(openai.RateLimitError, 429),
+        _status_error(openai.InternalServerError, 500),
+        _status_error(openai.AuthenticationError, 401),
+        _status_error(openai.PermissionDeniedError, 403),
+    ],
+)
+async def test_outages_are_reported_as_unavailable(error: Exception) -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=None, refusal=None))
+    completions.error = error
+
+    with pytest.raises(LLMUnavailableError):
+        await client.analyze_image(b"x", "image/png", context="page 1")
+
+
+async def test_bad_request_stays_a_plain_llm_error() -> None:
+    client, completions, _ = make_client(SimpleNamespace(parsed=None, refusal=None))
+    completions.error = _status_error(openai.BadRequestError, 400)
+
+    with pytest.raises(LLMError) as raised:
+        await client.analyze_image(b"x", "image/png", context="page 1")
+    assert not isinstance(raised.value, LLMUnavailableError)

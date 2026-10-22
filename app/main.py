@@ -8,9 +8,9 @@ from neo4j import AsyncGraphDatabase, NotificationDisabledClassification
 
 from app.api.deps import Services
 from app.api.routes import articles, auth, characters, health, relations
-from app.core.config import Settings
+from app.core.config import DEV_APP_TOKEN, DEV_JWT_SECRET, Settings
 from app.core.security import TokenService
-from app.graph.repository import DuplicateArticleError, GraphRepository
+from app.graph.repository import ClaimLostError, GraphRepository
 from app.llm.base import LLMClient, LLMError, LLMNotConfiguredError, UnconfiguredLLMClient
 from app.llm.openai_client import build_openai_client
 from app.pipeline.documents import DocumentError
@@ -50,17 +50,28 @@ def _register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(LLMError)
     async def llm_error(_: Request, exc: LLMError) -> JSONResponse:
         logger.error("LLM failure: %s", exc)
-        return _error(status.HTTP_502_BAD_GATEWAY, f"LLM backend error: {exc}")
+        return _error(status.HTTP_502_BAD_GATEWAY, "LLM backend error")
 
     @app.exception_handler(ArticleInProgressError)
-    @app.exception_handler(DuplicateArticleError)
-    async def in_progress(_: Request, exc: Exception) -> JSONResponse:
-        return _error(status.HTTP_409_CONFLICT, "An article with identical content is being processed")
+    async def in_progress(_: Request, exc: ArticleInProgressError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": "An article with identical content is being processed", "article_id": exc.article_id},
+        )
+
+    @app.exception_handler(ClaimLostError)
+    async def claim_lost(_: Request, exc: ClaimLostError) -> JSONResponse:
+        logger.warning("Upload superseded: %s", exc)
+        return _error(status.HTTP_503_SERVICE_UNAVAILABLE, "Upload was superseded; retry the request")
 
 
 def create_app(settings: Settings | None = None, llm_client: LLMClient | None = None) -> FastAPI:
     _configure_logging()
     settings = settings or Settings()
+    if settings.jwt_secret.get_secret_value() == DEV_JWT_SECRET:
+        logger.warning("JWT_SECRET is the public development default: set your own before exposing the service")
+    if DEV_APP_TOKEN in settings.app_tokens:
+        logger.warning("APP_TOKENS contains the public development token: set your own before exposing the service")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:

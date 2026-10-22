@@ -1,6 +1,10 @@
+from collections.abc import Sequence
+
+import neo4j
 import pymupdf
 
 from app.llm.schemas import ExtractedCharacter, ExtractedRelation, ExtractionResult
+from app.pipeline.normalization import name_key
 
 HARRY_DESCRIPTION = "A young wizard who attends Hogwarts School of Witchcraft and Wizardry"
 RON_DESCRIPTION = "Red haired boy from a large and poor wizarding family"
@@ -38,10 +42,11 @@ def solid_pixmap(width: int, height: int, gray: int = 120) -> pymupdf.Pixmap:
 
 
 def build_pdf(pages: list[dict]) -> bytes:
-    """Each page spec may contain: text, image_size (w, h), drawings (number of lines)."""
+    """Each page spec may contain: text, image_size (w, h), drawings (number of lines), page_size (w, h) in points."""
     document = pymupdf.open()
     for spec in pages:
-        page = document.new_page()
+        width, height = spec.get("page_size", (595, 842))
+        page = document.new_page(width=width, height=height)
         if text := spec.get("text"):
             page.insert_textbox(pymupdf.Rect(50, 50, 550, 400), text, fontsize=11)
         if image_size := spec.get("image_size"):
@@ -51,3 +56,38 @@ def build_pdf(pages: list[dict]) -> bytes:
     data = document.tobytes()
     document.close()
     return data
+
+
+def insert_character(
+    db: neo4j.Driver,
+    *,
+    id: str,
+    name: str,
+    aliases: Sequence[str] = (),
+    description: str = "x",
+    dims: int = 64,
+) -> None:
+    """Creates a Character through Cypher with every property the service's queries read."""
+    db.execute_query(
+        "CREATE (:Character {id: $id, name: $name, name_key: $name_key, aliases: $aliases, "
+        "alias_keys: $alias_keys, description: $description, embedding: $embedding, created_at: datetime()})",
+        id=id,
+        name=name,
+        name_key=name_key(name),
+        aliases=list(aliases),
+        alias_keys=[name_key(a) for a in aliases],
+        description=description,
+        embedding=[0.0] * (dims - 1) + [1.0],
+    )
+
+
+def insert_processing_article(
+    db: neo4j.Driver, *, article_id: str = "busy", content_hash: str = "h", age_minutes: int = 0
+) -> None:
+    db.execute_query(
+        "CREATE (:Article {id: $id, content_hash: $hash, status: 'processing', title: 't', "
+        "source_type: 'markdown', created_at: datetime() - duration({minutes: $age})})",
+        id=article_id,
+        hash=content_hash,
+        age=age_minutes,
+    )

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.deps import ServicesDep, require_access_token
 from app.graph.repository import Direction
+from app.llm.vocabulary import SYMMETRIC_RELATION_TYPES
 from app.pipeline.normalization import normalize_relation_type
 from app.schemas.api import CharacterOut, ConnectedCharactersResponse, ConnectionOut, RelationTypeOut
 
@@ -25,10 +26,13 @@ async def relation_types(services: ServicesDep) -> list[RelationTypeOut]:
         "1. a known inverse such as `child of`, answered through the canonical type (`PARENT_OF`) with the "
         "direction flipped, even if a stored type of that name exists; "
         "2. exact stored type; "
-        "3. vector candidates confirmed by the LLM judge. "
-        "`resolved_type` shows the type used. With the default `direction=any`, an inverse type also returns "
-        "the connections in the other direction (for example a character's children for `child of`); "
-        "each connection's `direction` field tells them apart."
+        "3. the same name with `_OF` appended (`friend` -> `FRIEND_OF`). "
+        "Anything else gives `resolved_type: null` and no connections. The lookup calls no LLM and writes nothing; "
+        "take a type from `/relations/types`. `resolved_type` shows the type used. With the default "
+        "`direction=any`, an inverse type also returns the connections in the other direction (for example a "
+        "character's children for `child of`); each connection's `direction` field tells them apart. "
+        "A symmetric type such as `FRIEND_OF` has no direction: `direction` is ignored and every connection "
+        "is reported as `outgoing`."
     ),
 )
 async def connected_characters(
@@ -41,10 +45,13 @@ async def connected_characters(
         normalized = normalize_relation_type(relation_type)
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-    # Outside the try: a backend failure is an LLMError (502), never a client error.
     query = await services.relation_types.find(normalized)
     resolved = query.name if query else None
-    effective_direction = _FLIPPED[direction] if query and query.inverse else direction
+    symmetric = resolved in SYMMETRIC_RELATION_TYPES
+    if symmetric:
+        effective_direction: Direction = "any"
+    else:
+        effective_direction = _FLIPPED[direction] if query and query.inverse else direction
 
     # An unknown type still must 404 for an unknown character, so the lookup runs either way.
     connections = await services.repository.get_connections(character_id, resolved or "", effective_direction)
@@ -55,7 +62,11 @@ async def connected_characters(
         requested_type=relation_type,
         resolved_type=resolved,
         connections=[
-            ConnectionOut(character=CharacterOut(**vars(c.character)), direction=c.direction, description=c.description)
+            ConnectionOut(
+                character=CharacterOut(**vars(c.character)),
+                direction="outgoing" if symmetric else c.direction,
+                description=c.description,
+            )
             for c in connections
         ],
     )

@@ -44,6 +44,17 @@ class ArticleUploadResponse(BaseModel):
     relations: list[RelationOut]
 
 
+class ArticleOut(BaseModel):
+    article_id: str
+    title: str
+    source_type: Literal["markdown", "pdf"]
+    status: Literal["processing", "stale", "completed"] = Field(
+        description="`stale`: the upload that claimed this article died; upload the content again"
+    )
+    characters: list[CharacterOut]
+    relations: list[RelationOut]
+
+
 class RelationTypeOut(BaseModel):
     type: str
     count: int
@@ -66,3 +77,7 @@ class ConnectedCharactersResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class ConflictResponse(ErrorResponse):
+    article_id: str

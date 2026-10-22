@@ -4,14 +4,14 @@ import logging
 import uuid
 from dataclasses import dataclass
 
-from app.graph.repository import CharacterRecord, GraphRepository
+from app.graph.repository import CharacterRecord, GraphRepository, GraphWriter
 from app.llm.base import LLMClient, LLMError
 from app.llm.judging import CharacterCard, RelationTypeCard
 from app.llm.schemas import ExtractedCharacter
 from app.llm.vocabulary import CANONICAL_RELATION_TYPES, INVERSE_RELATION_TYPES
 from app.pipeline.adjudication import group_verdicts
 from app.pipeline.merging import MAX_DESCRIPTION_CHARS
-from app.pipeline.normalization import identifying_tokens, name_key, normalize_relation_type, relation_type_phrase
+from app.pipeline.normalization import identifying_tokens, name_key, relation_type_phrase
 
 logger = logging.getLogger(__name__)
 
@@ -116,19 +116,19 @@ class CharacterResolver:
                 plan.creations.append((canonical, embedding, others))
         return plan
 
-    async def apply(self, plan: CharacterPlan) -> dict[str, CharacterRecord]:
+    async def apply(self, plan: CharacterPlan, writer: GraphWriter) -> dict[str, CharacterRecord]:
         """Writes the plan and returns extracted name -> stored character. Makes no LLM call."""
         resolved: dict[str, CharacterRecord] = {}
         current: dict[str, CharacterRecord] = {}  # by id, so that merges into one stored character build on each other
         for stored, members in [*((record, [member]) for record, member in plan.exact), *plan.merges]:
             for member in members:
-                record = await self._merge(current.get(stored.id, stored), member)
+                record = await self._merge(current.get(stored.id, stored), member, writer)
                 current[stored.id] = record
                 resolved[member.name] = record
         for canonical, embedding, others in plan.creations:
-            record = await self._create(canonical, embedding)
+            record = await self._create(canonical, embedding, writer)
             for other in others:
-                record = await self._merge(record, other)
+                record = await self._merge(record, other, writer)
             for member in (canonical, *others):
                 resolved[member.name] = record
         return resolved
@@ -142,17 +142,24 @@ class CharacterResolver:
         ]
         return list({record.id: record for channel in channels for record in channel}.values())
 
-    async def _create(self, character: ExtractedCharacter, embedding: list[float]) -> CharacterRecord:
+    async def _create(
+        self, character: ExtractedCharacter, embedding: list[float], writer: GraphWriter
+    ) -> CharacterRecord:
         aliases, alias_keys = _unique_by_key(character.aliases, exclude_key=name_key(character.name))
         record = CharacterRecord(
             id=str(uuid.uuid4()), name=character.name, aliases=aliases, description=character.description
         )
-        await self._repository.create_character(
+        stored, created = await writer.merge_character(
             record, name_key=name_key(character.name), alias_keys=alias_keys, embedding=embedding
         )
-        return record
+        if created:
+            return record
+        logger.info("Character %r was created by a concurrent upload; merging into it", stored.name)
+        return await self._merge(stored, character, writer)
 
-    async def _merge(self, existing: CharacterRecord, character: ExtractedCharacter) -> CharacterRecord:
+    async def _merge(
+        self, existing: CharacterRecord, character: ExtractedCharacter, writer: GraphWriter
+    ) -> CharacterRecord:
         aliases, alias_keys = _unique_by_key(
             [*existing.aliases, character.name, *character.aliases], exclude_key=name_key(existing.name)
         )
@@ -161,7 +168,7 @@ class CharacterResolver:
             description = f"{description} {character.description}".strip()[:MAX_DESCRIPTION_CHARS]
         merged = CharacterRecord(id=existing.id, name=existing.name, aliases=aliases, description=description)
         if merged != existing:
-            await self._repository.update_character(merged, alias_keys=alias_keys)
+            await writer.update_character(merged, alias_keys=alias_keys)
         return merged
 
 
@@ -193,7 +200,7 @@ class RelationTypeResolver:
         missing = [name for name in CANONICAL_RELATION_TYPES if name not in present]
         if missing:
             embeddings = await _embed(self._llm, [relation_type_phrase(name) for name in missing])
-            await self._repository.create_relation_types(list(zip(missing, embeddings, strict=True)))
+            await self._repository.seed_relation_types(list(zip(missing, embeddings, strict=True)))
         self._vocabulary_ready = True
 
     async def plan(self, types: list[str]) -> TypePlan:
@@ -244,46 +251,27 @@ class RelationTypeResolver:
                     logger.info("Relation type %s resolved to %s", new_by_ref[member], target)
         return TypePlan(mapping, to_create)
 
-    async def create_used(self, plan: TypePlan, used: set[str]) -> None:
+    async def create_used(self, plan: TypePlan, used: set[str], writer: GraphWriter) -> None:
         """Creates only the planned types that a stored edge actually uses."""
-        await self._repository.create_relation_types(
+        await writer.create_relation_types(
             [(name, embedding) for name, embedding in plan.to_create.items() if name in used]
         )
 
-    async def find(self, relation_type: str) -> TypeQuery | None:
-        """Query side: a known inverse, then exact name, then vector candidates confirmed by the judge.
-        The inverse map comes first so that a stray stored `CHILD_OF` cannot hide the `PARENT_OF` edges.
-        Raises ValueError for empty input."""
-        normalized = normalize_relation_type(relation_type)
-        if normalized in INVERSE_RELATION_TYPES:
-            return TypeQuery(INVERSE_RELATION_TYPES[normalized], inverse=True)
-        if normalized in CANONICAL_RELATION_TYPES or await self._repository.existing_relation_types([normalized]):
-            return TypeQuery(normalized, inverse=False)
-
-        await self.ensure_vocabulary()
-        [embedding] = await _embed(self._llm, [relation_type_phrase(normalized)])
-        found = await self._candidates(embedding, exclude_inverse_of=normalized)
-        if not found:
-            return None
-        refs = {name: f"S{i}" for i, name in enumerate(found, 1)}
-        judgement = await self._llm.judge_relation_types(
-            [RelationTypeCard("N1", normalized, tuple(refs.values()))],
-            [RelationTypeCard(ref, name) for name, ref in refs.items()],
-        )
-        [group] = group_verdicts(
-            {"N1": tuple(refs.values())},
-            judgement,
-            kind="relation type",
-            labels={"N1": normalized, **{ref: name for name, ref in refs.items()}},
-        )
-        if group.stored is None:
-            return None
-        stored = next(name for name, ref in refs.items() if ref == group.stored)
-        logger.info("Relation type %s resolved to %s", normalized, stored)
-        return TypeQuery(stored, inverse=False)
+    async def find(self, normalized: str) -> TypeQuery | None:
+        """Query side, with no LLM call and no write: a known inverse, then the exact name, then the name with `_OF`
+        appended (`friend` -> `FRIEND_OF`). The inverse map comes first so that a stray stored `CHILD_OF` cannot hide
+        the `PARENT_OF` edges."""
+        candidates = [normalized] if normalized.endswith("_OF") else [normalized, f"{normalized}_OF"]
+        stored = await self._repository.existing_relation_types(candidates)
+        for candidate in candidates:
+            if candidate in INVERSE_RELATION_TYPES:
+                return TypeQuery(INVERSE_RELATION_TYPES[candidate], inverse=True)
+            if candidate in CANONICAL_RELATION_TYPES or candidate in stored:
+                return TypeQuery(candidate, inverse=False)
+        return None
 
     async def _candidates(self, embedding: list[float], *, exclude_inverse_of: str) -> list[str]:
-        """An inverse is never a match candidate (spec D7), whatever the judge would say."""
+        """Inverse types are never offered as candidates, whatever the judge would say."""
         matches = await self._repository.find_similar_relation_types(embedding, RELATION_TYPE_SEARCH_WIDTH)
         names = [
             match.name

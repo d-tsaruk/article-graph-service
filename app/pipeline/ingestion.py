@@ -1,8 +1,8 @@
 import asyncio
 import hashlib
 import logging
-import time
 import uuid
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import PurePath
@@ -12,22 +12,23 @@ from app.graph.repository import (
     ArticleRecord,
     ArticleStatus,
     CharacterRecord,
+    ClaimLostError,
+    DuplicateArticleError,
     GraphRepository,
+    GraphWriter,
     RelationRecord,
 )
-from app.llm.base import LLMClient, LLMError
+from app.llm.base import LLMClient, LLMError, LLMNotConfiguredError, LLMUnavailableError
 from app.llm.schemas import ExtractionResult, ImageAnalysis
 from app.llm.vocabulary import CANONICAL_RELATION_TYPES, SYMMETRIC_RELATION_TYPES
 from app.pipeline.chunking import chunk_text
-from app.pipeline.documents import DocumentError, ParsedDocument, PdfOptions, parse_markdown, parse_pdf
+from app.pipeline.documents import DocumentError, Page, ParsedDocument, PdfOptions, Visual, parse_markdown, parse_pdf
 from app.pipeline.merging import merge_extractions
 from app.pipeline.resolution import CharacterResolver, RelationTypeResolver, TypePlan
 
 logger = logging.getLogger(__name__)
 
 KNOWN_RELATION_TYPES_IN_PROMPT = 100
-# A "processing" article older than this is a leftover of a crashed worker and may be reprocessed.
-STALE_PROCESSING_SECONDS = 15 * 60
 VISION_CONTEXT_TEXT_CHARS = 500
 
 
@@ -37,7 +38,9 @@ class SourceType(StrEnum):
 
 
 class ArticleInProgressError(Exception):
-    pass
+    def __init__(self, article_id: str) -> None:
+        super().__init__(article_id)
+        self.article_id = article_id
 
 
 @dataclass(frozen=True)
@@ -58,16 +61,28 @@ class IngestionResult:
     relations: list[RelationRecord]
 
 
-def unwrap_plan_failure(failure: ExceptionGroup) -> BaseException:
-    """Logs every failed plan and picks the one to raise: an LLMError (502/503) if any, else the first."""
+def unwrap_task_failure(failure: ExceptionGroup) -> BaseException:
+    """Logs every failed task and picks the one to raise: an LLMError (502/503) if any, else the first."""
     for exc in failure.exceptions:
-        logger.error("Resolution planning failed: %r", exc, exc_info=exc)
+        logger.error("Task failed: %r", exc, exc_info=exc)
     return next((exc for exc in failure.exceptions if isinstance(exc, LLMError)), failure.exceptions[0])
 
 
+async def _run_all[T](coros: list[Coroutine[object, object, T]]) -> list[T]:
+    """Runs the coroutines concurrently and returns their results in order. The first failure cancels the siblings."""
+    try:
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(coro) for coro in coros]
+    except ExceptionGroup as failure:
+        # Plain `except`, not `except*`: raising inside `except*` would wrap the error in a group again.
+        raise unwrap_task_failure(failure) from None
+    return [task.result() for task in tasks]
+
+
 class ArticleIngestionService:
-    """parse -> describe visuals -> chunk -> extract -> merge -> plan resolution (reads + LLM judges) -> persist.
-    All LLM calls finish before the first graph write, except the idempotent vocabulary seed."""
+    """hash lookup -> parse -> claim the hash (`processing` article) -> describe visuals -> chunk -> extract -> merge
+    -> plan resolution (reads + LLM judges) -> one write transaction. The claim makes a concurrent retry of the
+    same bytes fail fast with 409; every LLM call finishes before the transaction, and a failure releases the claim."""
 
     def __init__(
         self,
@@ -81,13 +96,7 @@ class ArticleIngestionService:
         self._settings = settings
         self._relation_types = relation_types
         self._characters = CharacterResolver(repository, llm, candidate_limit=settings.character_candidate_limit)
-        self._pdf_options = PdfOptions(
-            max_visual_items=settings.pdf_max_visual_items,
-            min_image_side_px=settings.pdf_min_image_side_px,
-            render_dpi=settings.pdf_render_dpi,
-            scanned_page_max_chars=settings.pdf_scanned_page_max_chars,
-            drawings_render_threshold=settings.pdf_drawings_render_threshold,
-        )
+        self._pdf_options = PdfOptions.from_settings(settings)
 
     async def ingest(self, upload: UploadedDocument) -> IngestionResult:
         content_hash = hashlib.sha256(upload.content).hexdigest()
@@ -95,26 +104,59 @@ class ArticleIngestionService:
         if existing is not None:
             if existing.status is ArticleStatus.COMPLETED:
                 return await self._existing_result(existing)
-            if time.time() - existing.created_at_epoch < STALE_PROCESSING_SECONDS:
+            if not existing.is_stale(self._settings.stale_processing_seconds):
                 raise ArticleInProgressError(existing.id)
+            logger.warning("Reprocessing stale article %s", existing.id)
+            await self._repository.delete_unfinished_article(
+                existing.id, older_than_seconds=self._settings.stale_processing_seconds
+            )
 
         document = await self._parse(upload)
+        self._chunks("\n\n".join(page.text for page in document.pages))
         title = upload.title or document.title or (PurePath(upload.filename).stem if upload.filename else None)
-        text = await self._build_text(document, title or "untitled")
-        if not text.strip():
-            raise DocumentError("no text or relevant visual content could be extracted")
 
-        extraction = await self._extract(text)
-        if existing is not None:
-            logger.warning("Reprocessing stale article %s", existing.id)
-            await self._repository.delete_article(existing.id)
-        return await self._persist(
-            title=title or "Untitled",
-            source_type=upload.source_type,
-            content_hash=content_hash,
-            text=text,
-            extraction=extraction,
-        )
+        article_id = str(uuid.uuid4())
+        try:
+            await self._repository.create_article(
+                article_id=article_id,
+                title=title or "Untitled",
+                source_type=upload.source_type.value,
+                content_hash=content_hash,
+            )
+        except DuplicateArticleError:
+            return await self._settled(content_hash)
+
+        try:
+            text = await self._build_text(document, title or "untitled")
+            if not text.strip():
+                raise DocumentError("no text or relevant visual content could be extracted")
+            extraction = await self._extract(text)
+            return await self._persist(
+                article_id=article_id,
+                title=title or "Untitled",
+                source_type=upload.source_type,
+                text=text,
+                extraction=extraction,
+            )
+        except BaseException as exc:
+            if not isinstance(exc, ClaimLostError):
+                logger.error("Ingesting article %s failed, releasing its claim", article_id)
+            try:
+                await self._repository.delete_unfinished_article(article_id)
+            except Exception:
+                logger.exception("Releasing the claim of article %s failed", article_id)
+            if isinstance(exc, ClaimLostError):
+                return await self._settled(content_hash)
+            raise
+
+    async def _settled(self, content_hash: str) -> IngestionResult:
+        """Another upload of the same bytes won the claim: report what it is doing or what it finished."""
+        existing = await self._repository.find_article_by_hash(content_hash)
+        if existing is None:
+            raise ClaimLostError(content_hash)
+        if existing.status is ArticleStatus.COMPLETED:
+            return await self._existing_result(existing)
+        raise ArticleInProgressError(existing.id)
 
     async def _existing_result(self, article: ArticleRecord) -> IngestionResult:
         characters = await self._repository.get_article_characters(article.id) or []
@@ -136,22 +178,39 @@ class ArticleIngestionService:
         except UnicodeDecodeError as exc:
             raise DocumentError("markdown must be UTF-8 encoded") from exc
 
+    def _chunks(self, text: str) -> list[str]:
+        chunks = chunk_text(text, self._settings.chunk_size_chars, self._settings.chunk_overlap_chars)
+        if len(chunks) > self._settings.max_chunks:
+            raise DocumentError(
+                f"document needs {len(chunks)} chunks; the limit is {self._settings.max_chunks} (MAX_CHUNKS)"
+            )
+        return chunks
+
+    async def _describe(self, page: Page, visual: Visual, title: str) -> ImageAnalysis | None:
+        try:
+            return await self._llm.analyze_image(
+                visual.data,
+                visual.mime_type,
+                context=f'page {page.number} of the document "{title}". '
+                f"Text on that page starts with: {page.text[:VISION_CONTEXT_TEXT_CHARS]!r}",
+            )
+        except (LLMNotConfiguredError, LLMUnavailableError):
+            raise
+        except LLMError as exc:
+            logger.warning("Visual on page %d of %r skipped: %s", page.number, title, exc)
+            return None
+
     async def _build_text(self, document: ParsedDocument, title: str) -> str:
         visuals = [(page, visual) for page in document.pages for visual in page.visuals]
-        analyses: list[ImageAnalysis] = await asyncio.gather(
-            *(
-                self._llm.analyze_image(
-                    visual.data,
-                    visual.mime_type,
-                    context=f'page {page.number} of the document "{title}". '
-                    f"Text on that page starts with: {page.text[:VISION_CONTEXT_TEXT_CHARS]!r}",
-                )
-                for page, visual in visuals
-            )
-        )
+        analyses = await _run_all([self._describe(page, visual, title) for page, visual in visuals])
+        skipped = sum(a is None for a in analyses)
+        if skipped:
+            logger.warning("%d of %d visuals skipped for %r", skipped, len(visuals), title)
+        if visuals and all(a is None for a in analyses) and not any(page.text for page in document.pages):
+            raise LLMError("every visual description failed")
         descriptions: dict[int, list[str]] = {}
         for (page, _), analysis in zip(visuals, analyses, strict=True):
-            if analysis.is_relevant and analysis.description.strip():
+            if analysis and analysis.is_relevant and analysis.description.strip():
                 descriptions.setdefault(page.number, []).append(analysis.description.strip())
 
         sections = []
@@ -163,37 +222,32 @@ class ArticleIngestionService:
         return "\n\n".join(sections)
 
     async def _extract(self, text: str) -> ExtractionResult:
-        chunks = chunk_text(text, self._settings.chunk_size_chars, self._settings.chunk_overlap_chars)
+        chunks = self._chunks(text)
         used = [name for name, _ in await self._repository.list_relation_types()]
         known_types = [*CANONICAL_RELATION_TYPES, *sorted(set(used) - set(CANONICAL_RELATION_TYPES))]
         known_types = known_types[:KNOWN_RELATION_TYPES_IN_PROMPT]
-        results = await asyncio.gather(*(self._llm.extract(chunk, known_types) for chunk in chunks))
+        results = await _run_all([self._llm.extract(chunk, known_types) for chunk in chunks])
         logger.info("Extracted from %d chunks", len(chunks))
-        return merge_extractions(list(results))
+        return merge_extractions(results)
 
     async def _persist(
-        self, *, title: str, source_type: SourceType, content_hash: str, text: str, extraction: ExtractionResult
+        self, *, article_id: str, title: str, source_type: SourceType, text: str, extraction: ExtractionResult
     ) -> IngestionResult:
-        try:
-            async with asyncio.TaskGroup() as group:  # cancels the sibling plan if one fails
-                type_task = group.create_task(self._relation_types.plan([r.type for r in extraction.relations]))
-                character_task = group.create_task(self._characters.plan(extraction.characters))
-        except ExceptionGroup as failure:
-            # Plain `except`, not `except*`: raising inside `except*` would wrap the error in a group again.
-            raise unwrap_plan_failure(failure) from None
-        type_plan, character_plan = type_task.result(), character_task.result()
-
-        article_id = str(uuid.uuid4())
-        await self._repository.create_article(
-            article_id=article_id, title=title, source_type=source_type.value, content_hash=content_hash, text=text
+        type_plan, character_plan = await _run_all(
+            [
+                self._relation_types.plan([r.type for r in extraction.relations]),
+                self._characters.plan(extraction.characters),
+            ]
         )
-        try:
-            resolved = await self._characters.apply(character_plan)
+
+        async def work(writer: GraphWriter) -> tuple[list[CharacterRecord], list[RelationRecord]]:
+            await writer.complete_article(article_id, text)
+            resolved = await self._characters.apply(character_plan, writer)
             characters = list({record.id: record for record in resolved.values()}.values())
-            await self._repository.link_characters_to_article(article_id, [c.id for c in characters])
+            await writer.link_characters_to_article(article_id, [c.id for c in characters])
             relations = _build_relations(extraction, resolved, type_plan)
-            await self._relation_types.create_used(type_plan, {r.type for r in relations})
-            await self._repository.upsert_relations(
+            await self._relation_types.create_used(type_plan, {r.type for r in relations}, writer)
+            await writer.upsert_relations(
                 article_id,
                 [
                     {
@@ -205,12 +259,9 @@ class ArticleIngestionService:
                     for r in relations
                 ],
             )
-            await self._repository.mark_article_completed(article_id)
-        except Exception:
-            logger.exception("Persisting article %s failed, rolling it back", article_id)
-            await self._repository.delete_article(article_id)
-            raise
+            return characters, relations
 
+        characters, relations = await self._repository.write_transaction(work)
         return IngestionResult(
             article_id=article_id,
             title=title,

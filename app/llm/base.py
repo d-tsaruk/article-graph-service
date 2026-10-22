@@ -8,6 +8,10 @@ class LLMError(Exception):
     """The model backend failed or returned an unusable response."""
 
 
+class LLMUnavailableError(LLMError):
+    """A retryable or systemic backend failure (transport, rate limit, timeout, auth, 5xx), not a bad answer."""
+
+
 class LLMNotConfiguredError(LLMError):
     pass
 
@@ -25,7 +29,7 @@ class LLMClient(Protocol):
 
 
 class UnconfiguredLLMClient:
-    """Keeps read-only endpoints usable when no API key is provided."""
+    """Keeps every read endpoint usable without an API key."""
 
     async def extract(self, text: str, known_relation_types: list[str]) -> ExtractionResult:
         raise LLMNotConfiguredError("OPENAI_API_KEY is not configured")

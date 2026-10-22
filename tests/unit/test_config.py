@@ -74,3 +74,27 @@ def test_model_defaults() -> None:
     assert settings.llm_model == "gpt-4.1-mini"
     assert settings.vision_model == "gpt-4o-mini"
     assert settings.judge_model == "gpt-4o-mini"
+
+
+def test_limit_defaults() -> None:
+    settings = make()
+
+    assert settings.max_pdf_pages == 100
+    assert settings.max_chunks == 50
+    assert settings.pdf_max_render_side_px == 2048
+    assert settings.stale_processing_seconds == 1800
+
+
+@pytest.mark.parametrize("algorithm", ["none", "RS256"])
+def test_jwt_algorithm_is_restricted_to_hmac(algorithm: str) -> None:
+    with pytest.raises(ValidationError):
+        make(jwt_algorithm=algorithm)
+
+
+def test_hmac_jwt_algorithm_is_accepted() -> None:
+    assert make(jwt_algorithm="HS512").jwt_algorithm == "HS512"
+
+
+def test_chunk_overlap_must_be_smaller_than_chunk_size() -> None:
+    with pytest.raises(ValidationError):
+        make(chunk_size_chars=100, chunk_overlap_chars=100)

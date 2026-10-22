@@ -4,8 +4,16 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 
 from app.api.deps import ServicesDep, require_access_token
+from app.graph.repository import ArticleStatus
 from app.pipeline.ingestion import SourceType, UploadedDocument
-from app.schemas.api import ArticleUploadResponse, CharacterOut, ErrorResponse, RelationOut
+from app.schemas.api import (
+    ArticleOut,
+    ArticleUploadResponse,
+    CharacterOut,
+    ConflictResponse,
+    ErrorResponse,
+    RelationOut,
+)
 
 router = APIRouter(prefix="/articles", tags=["articles"], dependencies=[Depends(require_access_token)])
 
@@ -42,12 +50,18 @@ async def _read_limited(file: UploadFile, limit: int) -> bytes:
     summary="Upload a Markdown text or a Markdown/PDF file and extract characters and relations",
     responses={
         200: {"model": ArticleUploadResponse, "description": "Identical content was already processed"},
-        409: {"model": ErrorResponse, "description": "Identical content is being processed right now"},
+        409: {
+            "model": ConflictResponse,
+            "description": "Identical content is being processed right now; poll GET /articles/{article_id}",
+        },
         413: {"model": ErrorResponse},
         415: {"model": ErrorResponse},
         422: {"description": "Invalid input or unreadable document"},
         502: {"model": ErrorResponse, "description": "LLM backend failure"},
-        503: {"model": ErrorResponse, "description": "LLM backend is not configured"},
+        503: {
+            "model": ErrorResponse,
+            "description": 'LLM backend is not configured (permanent), or "Upload was superseded; retry the request"',
+        },
     },
 )
 async def upload_article(
@@ -84,4 +98,30 @@ async def upload_article(
         duplicate=result.duplicate,
         characters=[CharacterOut(**vars(c)) for c in result.characters],
         relations=[RelationOut(**vars(r)) for r in result.relations],
+    )
+
+
+@router.get(
+    "/{article_id}",
+    summary="Processing status of an article and, once completed, its characters and relations",
+    responses={404: {"model": ErrorResponse}},
+)
+async def get_article(article_id: str, services: ServicesDep) -> ArticleOut:
+    article = await services.repository.get_article(article_id)
+    if article is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Article not found")
+    if article.status is ArticleStatus.COMPLETED:
+        article_status = "completed"
+        characters = await services.repository.get_article_characters(article_id) or []
+        relations = await services.repository.get_article_relations(article_id)
+    else:
+        article_status = "stale" if article.is_stale(services.settings.stale_processing_seconds) else "processing"
+        characters, relations = [], []
+    return ArticleOut(
+        article_id=article.id,
+        title=article.title,
+        source_type=article.source_type,
+        status=article_status,
+        characters=[CharacterOut(**vars(c)) for c in characters],
+        relations=[RelationOut(**vars(r)) for r in relations],
     )

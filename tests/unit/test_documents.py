@@ -1,5 +1,9 @@
+import dataclasses
+
+import pymupdf
 import pytest
 
+from app.core.config import Settings
 from app.pipeline.documents import DocumentError, PdfOptions, VisualKind, parse_markdown, parse_pdf
 from tests.factories import build_pdf
 
@@ -9,6 +13,8 @@ OPTIONS = PdfOptions(
     render_dpi=72,
     scanned_page_max_chars=10,
     drawings_render_threshold=20,
+    max_pages=100,
+    max_render_side_px=2048,
 )
 
 
@@ -101,3 +107,63 @@ def test_pdf_title_falls_back_to_metadata() -> None:
 def test_invalid_pdf_raises_document_error() -> None:
     with pytest.raises(DocumentError):
         parse_pdf(b"%PDF-1.7 not really", OPTIONS)
+
+
+def test_pdf_over_page_limit_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*_: object, **__: object) -> None:
+        raise AssertionError("a page was read")
+
+    monkeypatch.setattr(pymupdf.Page, "get_drawings", fail)
+    pdf = build_pdf([{"text": "a"}, {"text": "b"}, {"text": "c"}])
+
+    with pytest.raises(DocumentError, match="MAX_PDF_PAGES"):
+        parse_pdf(pdf, dataclasses.replace(OPTIONS, max_pages=2))
+
+
+def side_lengths(data: bytes) -> tuple[int, int]:
+    pixmap = pymupdf.Pixmap(data)
+    return pixmap.width, pixmap.height
+
+
+def test_page_render_is_clamped_to_max_side() -> None:
+    pdf = build_pdf([{"text": "A huge poster.", "drawings": 40, "page_size": (3000, 3000)}])
+
+    visuals = parse_pdf(pdf, dataclasses.replace(OPTIONS, render_dpi=150)).pages[0].visuals
+
+    assert [v.kind for v in visuals] == [VisualKind.PAGE_RENDER]
+    assert max(side_lengths(visuals[0].data)) <= 2048
+
+
+def test_oversized_embedded_image_is_downscaled() -> None:
+    pdf = build_pdf([{"text": "A long banner.", "image_size": (4000, 400)}])
+
+    visual = parse_pdf(pdf, OPTIONS).pages[0].visuals[0]
+
+    assert visual.kind is VisualKind.EMBEDDED_IMAGE
+    assert visual.mime_type == "image/png"
+    assert max(side_lengths(visual.data)) <= 2048
+
+
+def test_pdf_options_from_settings() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_tokens=["t"],
+        jwt_secret="x" * 32,
+        pdf_max_visual_items=7,
+        pdf_min_image_side_px=33,
+        pdf_render_dpi=111,
+        pdf_scanned_page_max_chars=5,
+        pdf_drawings_render_threshold=9,
+        max_pdf_pages=12,
+        pdf_max_render_side_px=999,
+    )
+
+    assert PdfOptions.from_settings(settings) == PdfOptions(
+        max_visual_items=7,
+        min_image_side_px=33,
+        render_dpi=111,
+        scanned_page_max_chars=5,
+        drawings_render_threshold=9,
+        max_pages=12,
+        max_render_side_px=999,
+    )

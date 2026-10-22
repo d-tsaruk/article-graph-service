@@ -3,8 +3,10 @@ import time
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from neo4j.exceptions import AuthError, DatabaseUnavailable, ServiceUnavailable, SessionExpired
 
 from app.core.config import Settings
+from app.graph.repository import GraphRepository
 from tests.integration.conftest import APP_TOKEN
 
 PROTECTED_ENDPOINTS = [
@@ -13,6 +15,7 @@ PROTECTED_ENDPOINTS = [
     ("GET", "/relations/types"),
     ("GET", "/relations/connected/some-id?type=FRIEND_OF"),
     ("POST", "/articles/upload"),
+    ("GET", "/articles/some-id"),
 ]
 
 
@@ -83,3 +86,26 @@ def test_expired_access_token_is_rejected(client: TestClient, settings: Settings
     response = client.get("/characters", headers={"Authorization": f"Bearer {expired}"})
 
     assert response.status_code == 401
+
+
+def test_health_is_public_and_ok(client: TestClient) -> None:
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("error", [ServiceUnavailable, SessionExpired, DatabaseUnavailable, AuthError])
+def test_health_returns_503_when_neo4j_is_down(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: type[Exception]
+) -> None:
+    async def down(self: GraphRepository) -> None:
+        raise error("neo4j is down")
+
+    monkeypatch.setattr(GraphRepository, "ping", down)
+
+    response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert "health check failed" in caplog.text

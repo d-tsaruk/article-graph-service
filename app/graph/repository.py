@@ -1,9 +1,11 @@
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
 
 import neo4j
-from neo4j import AsyncDriver, RoutingControl
+from neo4j import AsyncDriver, AsyncManagedTransaction, RoutingControl
 from neo4j.exceptions import ConstraintError
 
 from app.llm.vocabulary import SYMMETRIC_RELATION_TYPES
@@ -23,6 +25,10 @@ class DuplicateArticleError(Exception):
     pass
 
 
+class ClaimLostError(Exception):
+    """The article's `processing` claim no longer exists: another upload superseded it as stale."""
+
+
 Direction = Literal["any", "outgoing", "incoming"]
 
 
@@ -33,6 +39,9 @@ class ArticleRecord:
     source_type: str
     status: ArticleStatus
     created_at_epoch: int
+
+    def is_stale(self, threshold_seconds: int) -> bool:
+        return self.status is ArticleStatus.PROCESSING and time.time() - self.created_at_epoch >= threshold_seconds
 
 
 @dataclass(frozen=True)
@@ -108,7 +117,9 @@ class GraphRepository:
             "CREATE CONSTRAINT article_id IF NOT EXISTS FOR (a:Article) REQUIRE a.id IS UNIQUE",
             "CREATE CONSTRAINT article_content_hash IF NOT EXISTS FOR (a:Article) REQUIRE a.content_hash IS UNIQUE",
             "CREATE CONSTRAINT character_id IF NOT EXISTS FOR (c:Character) REQUIRE c.id IS UNIQUE",
-            "CREATE INDEX character_name_key IF NOT EXISTS FOR (c:Character) ON (c.name_key)",
+            # Neo4j refuses the constraint while a range index exists on the same property.
+            "DROP INDEX character_name_key IF EXISTS",
+            "CREATE CONSTRAINT character_name_key_unique IF NOT EXISTS FOR (c:Character) REQUIRE c.name_key IS UNIQUE",
             "CREATE CONSTRAINT relation_type_name IF NOT EXISTS FOR (t:RelationType) REQUIRE t.name IS UNIQUE",
             "CREATE INDEX related_to_type IF NOT EXISTS FOR ()-[r:RELATED_TO]-() ON (r.type)",
             f"CREATE VECTOR INDEX {CHARACTER_VECTOR_INDEX} IF NOT EXISTS "
@@ -123,11 +134,17 @@ class GraphRepository:
     # Articles
 
     async def find_article_by_hash(self, content_hash: str) -> ArticleRecord | None:
+        return await self._find_article("content_hash", content_hash)
+
+    async def get_article(self, article_id: str) -> ArticleRecord | None:
+        return await self._find_article("id", article_id)
+
+    async def _find_article(self, key: Literal["id", "content_hash"], value: str) -> ArticleRecord | None:
         records = await self._read(
-            "MATCH (a:Article {content_hash: $content_hash}) "
+            f"MATCH (a:Article {{{key}: $value}}) "
             "RETURN a.id AS id, a.title AS title, a.source_type AS source_type, a.status AS status, "
             "a.created_at.epochSeconds AS created_at_epoch",
-            content_hash=content_hash,
+            value=value,
         )
         if not records:
             return None
@@ -140,50 +157,30 @@ class GraphRepository:
             created_at_epoch=record["created_at_epoch"],
         )
 
-    async def create_article(
-        self, *, article_id: str, title: str, source_type: str, content_hash: str, text: str
-    ) -> None:
+    async def create_article(self, *, article_id: str, title: str, source_type: str, content_hash: str) -> None:
         try:
             await self._write(
                 "CREATE (:Article {id: $id, title: $title, source_type: $source_type, "
-                "content_hash: $content_hash, text: $text, status: $status, created_at: datetime()})",
+                "content_hash: $content_hash, status: $status, created_at: datetime()})",
                 id=article_id,
                 title=title,
                 source_type=source_type,
                 content_hash=content_hash,
-                text=text,
                 status=ArticleStatus.PROCESSING.value,
             )
         except ConstraintError as exc:
             raise DuplicateArticleError(content_hash) from exc
 
-    async def mark_article_completed(self, article_id: str) -> None:
+    async def delete_unfinished_article(self, article_id: str, *, older_than_seconds: int = 0) -> None:
+        """Releases a claim, optionally only when it is older than `older_than_seconds` (a stale reclaim).
+        The node is locked before its status is read: at read-committed isolation a plain `MATCH ... {status}`
+        would not be re-checked after waiting for a concurrent commit, and would delete a completed article."""
         await self._write(
-            "MATCH (a:Article {id: $id}) SET a.status = $status, a.completed_at = datetime()",
-            id=article_id,
-            status=ArticleStatus.COMPLETED.value,
-        )
-
-    async def delete_article(self, article_id: str) -> None:
-        await self._write(
-            "MATCH (a:Article {id: $id}) "
-            "OPTIONAL MATCH ()-[r:RELATED_TO]->() WHERE $id IN r.article_ids "
-            "WITH a, collect(r) AS relations "
-            "FOREACH (r IN [x IN relations WHERE size(x.article_ids) = 1] | DELETE r) "
-            "FOREACH (r IN [x IN relations WHERE size(x.article_ids) > 1] | "
-            "  SET r.article_ids = [i IN r.article_ids WHERE i <> $id]) "
+            f"MATCH (a:Article {{id: $id}}) {_LOCK} "
+            "WITH a WHERE a.status = 'processing' AND a.created_at <= datetime() - duration({seconds: $age}) "
             "DETACH DELETE a",
             id=article_id,
-        )
-
-    async def link_characters_to_article(self, article_id: str, character_ids: list[str]) -> None:
-        await self._write(
-            "MATCH (a:Article {id: $article_id}) "
-            "UNWIND $character_ids AS character_id "
-            "MATCH (c:Character {id: character_id}) "
-            "MERGE (a)-[:MENTIONS]->(c)",
-            article_id=article_id,
-            character_ids=character_ids,
+            age=older_than_seconds,
         )
 
     async def get_article_characters(self, article_id: str) -> list[CharacterRecord] | None:
@@ -251,31 +248,6 @@ class GraphRepository:
         )
         return [CharacterMatch(CharacterRecord.from_map(r["c"]), r["score"]) for r in records]
 
-    async def create_character(
-        self, character: CharacterRecord, *, name_key: str, alias_keys: list[str], embedding: list[float]
-    ) -> None:
-        await self._write(
-            "CREATE (:Character {id: $id, name: $name, name_key: $name_key, aliases: $aliases, "
-            "alias_keys: $alias_keys, description: $description, embedding: $embedding, created_at: datetime()})",
-            id=character.id,
-            name=character.name,
-            name_key=name_key,
-            aliases=character.aliases,
-            alias_keys=alias_keys,
-            description=character.description,
-            embedding=embedding,
-        )
-
-    async def update_character(self, character: CharacterRecord, *, alias_keys: list[str]) -> None:
-        await self._write(
-            "MATCH (c:Character {id: $id}) "
-            "SET c.aliases = $aliases, c.alias_keys = $alias_keys, c.description = $description",
-            id=character.id,
-            aliases=character.aliases,
-            alias_keys=alias_keys,
-            description=character.description,
-        )
-
     async def list_characters(self, limit: int, offset: int) -> list[CharacterRecord]:
         records = await self._read(
             f"MATCH (c:Character) RETURN c {_CHARACTER_PROJECTION} AS c ORDER BY c.name, c.id "
@@ -286,37 +258,6 @@ class GraphRepository:
         return [CharacterRecord.from_map(r["c"]) for r in records]
 
     # Relations
-
-    async def upsert_relations(self, article_id: str, relations: list[dict[str, str]]) -> None:
-        """Symmetric types reuse an edge stored in either direction. A new one is always created source -> target:
-        an undirected MERGE leaves the orientation of the created edge unspecified, so it is not used."""
-        symmetric = [r for r in relations if r["type"] in SYMMETRIC_RELATION_TYPES]
-        directed = [r for r in relations if r["type"] not in SYMMETRIC_RELATION_TYPES]
-        if directed:
-            await self._write(
-                "UNWIND $relations AS rel "
-                "MATCH (s:Character {id: rel.source_id}), (t:Character {id: rel.target_id}) "
-                "MERGE (s)-[r:RELATED_TO {type: rel.type}]->(t) "
-                "ON CREATE SET r.description = rel.description, r.article_ids = [$article_id], "
-                "  r.created_at = datetime() "
-                "ON MATCH SET r.article_ids = CASE WHEN $article_id IN r.article_ids THEN r.article_ids "
-                "  ELSE r.article_ids + $article_id END",
-                article_id=article_id,
-                relations=directed,
-            )
-        if symmetric:
-            await self._write(
-                "UNWIND $relations AS rel "
-                "MATCH (s:Character {id: rel.source_id}), (t:Character {id: rel.target_id}) "
-                "OPTIONAL MATCH (s)-[r:RELATED_TO {type: rel.type}]-(t) "
-                "FOREACH (_ IN CASE WHEN r IS NULL THEN [1] ELSE [] END | "
-                "  CREATE (s)-[:RELATED_TO {type: rel.type, description: rel.description, "
-                "    article_ids: [$article_id], created_at: datetime()}]->(t)) "
-                "FOREACH (_ IN CASE WHEN r IS NOT NULL AND NOT $article_id IN r.article_ids THEN [1] ELSE [] END | "
-                "  SET r.article_ids = r.article_ids + $article_id)",
-                article_id=article_id,
-                relations=symmetric,
-            )
 
     async def list_relation_types(self) -> list[tuple[str, int]]:
         records = await self._read(
@@ -369,12 +310,124 @@ class GraphRepository:
         )
         return [RelationTypeMatch(r["name"], r["score"]) for r in records]
 
-    async def create_relation_types(self, items: list[tuple[str, list[float]]]) -> None:
-        if not items:
-            return
-        await self._write(
-            "UNWIND $items AS item "
-            "MERGE (t:RelationType {name: item.name}) "
-            "ON CREATE SET t.embedding = item.embedding, t.created_at = datetime()",
-            items=[{"name": name, "embedding": embedding} for name, embedding in items],
+    async def seed_relation_types(self, items: list[tuple[str, list[float]]]) -> None:
+        if items:
+            await self._write(_CREATE_RELATION_TYPES, items=_type_params(items))
+
+    async def write_transaction[T](self, work: Callable[["GraphWriter"], Awaitable[T]]) -> T:
+        """Runs `work` in one write transaction. The driver may re-run it on a transient error, so `work`
+        must make no LLM call and no side effect outside the transaction."""
+        async with self._driver.session(database=self._database) as session:
+            return await session.execute_write(lambda tx: work(GraphWriter(tx)))
+
+
+# Takes the node's write lock without leaving a property behind.
+_LOCK = "SET a._lock = true REMOVE a._lock"
+
+_CREATE_RELATION_TYPES = (
+    "UNWIND $items AS item "
+    "MERGE (t:RelationType {name: item.name}) "
+    "ON CREATE SET t.embedding = item.embedding, t.created_at = datetime()"
+)
+
+
+def _type_params(items: list[tuple[str, list[float]]]) -> list[dict[str, Any]]:
+    return [{"name": name, "embedding": embedding} for name, embedding in items]
+
+
+class GraphWriter:
+    """The write operations of one ingestion, all inside a single transaction."""
+
+    def __init__(self, tx: AsyncManagedTransaction) -> None:
+        self._tx = tx
+
+    async def _run(self, query: str, **params: Any) -> list[dict[str, Any]]:
+        result = await self._tx.run(query, params)
+        return await result.data()
+
+    async def complete_article(self, article_id: str, text: str) -> None:
+        rows = await self._run(
+            f"MATCH (a:Article {{id: $id}}) {_LOCK} "
+            "WITH a WHERE a.status = 'processing' "
+            "SET a.text = $text, a.status = $status, a.completed_at = datetime() RETURN a.id AS id",
+            id=article_id,
+            text=text,
+            status=ArticleStatus.COMPLETED.value,
         )
+        if not rows:
+            raise ClaimLostError(article_id)
+
+    async def merge_character(
+        self, character: CharacterRecord, *, name_key: str, alias_keys: list[str], embedding: list[float]
+    ) -> tuple[CharacterRecord, bool]:
+        """Creates the character, or returns the one another upload committed under the same `name_key`.
+        The boolean tells whether this call created it."""
+        rows = await self._run(
+            "MERGE (c:Character {name_key: $name_key}) "
+            "ON CREATE SET c.id = $id, c.name = $name, c.aliases = $aliases, c.alias_keys = $alias_keys, "
+            "  c.description = $description, c.embedding = $embedding, c.created_at = datetime() "
+            f"RETURN c {_CHARACTER_PROJECTION} AS c, c.id = $id AS created",
+            id=character.id,
+            name=character.name,
+            name_key=name_key,
+            aliases=character.aliases,
+            alias_keys=alias_keys,
+            description=character.description,
+            embedding=embedding,
+        )
+        return CharacterRecord.from_map(rows[0]["c"]), rows[0]["created"]
+
+    async def update_character(self, character: CharacterRecord, *, alias_keys: list[str]) -> None:
+        await self._run(
+            "MATCH (c:Character {id: $id}) "
+            "SET c.aliases = $aliases, c.alias_keys = $alias_keys, c.description = $description",
+            id=character.id,
+            aliases=character.aliases,
+            alias_keys=alias_keys,
+            description=character.description,
+        )
+
+    async def link_characters_to_article(self, article_id: str, character_ids: list[str]) -> None:
+        await self._run(
+            "MATCH (a:Article {id: $article_id}) "
+            "UNWIND $character_ids AS character_id "
+            "MATCH (c:Character {id: character_id}) "
+            "MERGE (a)-[:MENTIONS]->(c)",
+            article_id=article_id,
+            character_ids=character_ids,
+        )
+
+    async def upsert_relations(self, article_id: str, relations: list[dict[str, str]]) -> None:
+        """Symmetric types reuse an edge stored in either direction. A new one is always created source -> target:
+        an undirected MERGE leaves the orientation of the created edge unspecified, so it is not used."""
+        symmetric = [r for r in relations if r["type"] in SYMMETRIC_RELATION_TYPES]
+        directed = [r for r in relations if r["type"] not in SYMMETRIC_RELATION_TYPES]
+        if directed:
+            await self._run(
+                "UNWIND $relations AS rel "
+                "MATCH (s:Character {id: rel.source_id}), (t:Character {id: rel.target_id}) "
+                "MERGE (s)-[r:RELATED_TO {type: rel.type}]->(t) "
+                "ON CREATE SET r.description = rel.description, r.article_ids = [$article_id], "
+                "  r.created_at = datetime() "
+                "ON MATCH SET r.article_ids = CASE WHEN $article_id IN r.article_ids THEN r.article_ids "
+                "  ELSE r.article_ids + $article_id END",
+                article_id=article_id,
+                relations=directed,
+            )
+        if symmetric:
+            await self._run(
+                "UNWIND $relations AS rel "
+                "MATCH (s:Character {id: rel.source_id}), (t:Character {id: rel.target_id}) "
+                "OPTIONAL MATCH (s)-[r:RELATED_TO {type: rel.type}]-(t) "
+                "FOREACH (_ IN CASE WHEN r IS NULL THEN [1] ELSE [] END | "
+                "  CREATE (s)-[:RELATED_TO {type: rel.type, description: rel.description, "
+                "    article_ids: [$article_id], created_at: datetime()}]->(t)) "
+                "FOREACH (_ IN CASE WHEN r IS NOT NULL AND NOT $article_id IN r.article_ids THEN [1] ELSE [] END | "
+                "  SET r.article_ids = r.article_ids + $article_id)",
+                article_id=article_id,
+                relations=symmetric,
+            )
+
+    async def create_relation_types(self, items: list[tuple[str, list[float]]]) -> None:
+        if items:
+            await self._run(_CREATE_RELATION_TYPES, items=_type_params(items))

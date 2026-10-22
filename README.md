@@ -1,8 +1,8 @@
 # Article Graph Service
 
 A FastAPI microservice that reads articles (Markdown or PDF, including their images and graphics), extracts
-characters and the relations between them with an LLM, and stores everything in a Neo4j graph. Neo4j's
-built-in vector index is used for entity and relation-type deduplication and for semantic lookup of relation types.
+characters and the relations between them with an LLM, and stores everything in a Neo4j graph. Neo4j's built-in
+vector index is used for entity and relation-type deduplication. It is built to be called by a Django monolith.
 
 - **API:** FastAPI, JWT auth (App Token → access + refresh)
 - **LLM:** OpenAI or any OpenAI-compatible API, Structured Outputs validated by Pydantic
@@ -12,130 +12,100 @@ built-in vector index is used for entity and relation-type deduplication and for
 ## Quick start
 
 ```bash
-cp .env.example .env          # put your OPENAI_API_KEY there
+cp .env.example .env          # then set OPENAI_API_KEY in it
 docker compose up -d          # or: docker-compose up -d
 open http://localhost:8000/docs
 ```
 
-Without `.env` the stack still starts with development defaults: the read endpoints work and uploads return `503`
-until `OPENAI_API_KEY` is set. Neo4j Browser is available at http://localhost:7474 (`neo4j` / `local-dev-password`).
+Without a key every read endpoint works (none of them calls the LLM) and uploads return `503`. Without `.env` the
+stack starts with development defaults. Neo4j Browser: http://localhost:7474 (`neo4j` / `local-dev-password`).
+
+## Key decisions and trade-offs
+
+- **One Neo4j for graph and vectors:** one store to run, and a character's edges and embedding commit together.
+- **Relation type as an edge property:** the vocabulary is open-ended and Cypher cannot parameterize relationship types.
+- **Retrieval plus an LLM judge, not thresholds:** none separates aliases from different people
+  ([why](#deduplication-and-the-vector-index)).
+- **All LLM calls before one write transaction:** any failure leaves the graph unchanged.
+- **Content-hash idempotency, claimed before the LLM work:** a retry of the same bytes never pays twice.
+- **Synchronous upload plus `GET /articles/{id}`:** simple now; the next step is `202` plus a worker.
+- **Inverse types canonicalized, symmetric types stored once:** one edge per fact.
+- **Stateless JWT:** no session store; refresh tokens cannot be revoked.
+- **No LLM on reads:** a GET costs nothing, writes nothing and works without an API key.
+- **Single tenant, single corpus:** one shared graph; an exact name merges across articles (scoping needs a `corpus` key).
 
 ## Architecture
 
 ```
-                   ┌──────────────────────────── FastAPI (app/) ────────────────────────────┐
- client ──JWT──▶   │  api/routes ──▶ pipeline/ingestion.ArticleIngestionService             │
-                   │                   │                                                    │
-                   │                   ├─ 1. documents.parse_pdf / parse_markdown (PyMuPDF) │
-                   │                   ├─ 2. LLM vision: describe images & rendered pages   │
-                   │                   ├─ 3. chunking.chunk_text (paragraph packing+overlap)│
-                   │                   ├─ 4. LLM extraction per chunk (Structured Outputs)  │
-                   │                   ├─ 5. merging.merge_extractions (name-anchored)      │
-                   │                   ├─ 6. resolution: vector/name candidates → LLM judge │
-                   │                   └─ 7. graph/repository: persist                      │
-                   └───────────────┬───────────────────────────────┬────────────────────────┘
-                                   │ Bolt                          │ HTTPS
-                          ┌────────▼────────┐             ┌────────▼────────┐
-                          │ Neo4j 5         │             │ OpenAI-compat.  │
-                          │ graph + vectors │             │ chat / vision / │
-                          └─────────────────┘             │ embeddings      │
-                                                          └─────────────────┘
+client ──JWT──▶ FastAPI api/routes ──▶ pipeline/ingestion.ArticleIngestionService
+                  1. documents.parse_pdf / parse_markdown (PyMuPDF), claim: Article{processing}
+                  2. LLM vision, 3. chunking, 4. LLM extraction per chunk, 5. merging
+                  6. resolution: vector/name candidates → LLM judge (reads and LLM calls only)
+                  7. graph/repository: ONE write transaction   ──Bolt──▶ Neo4j 5 (graph + vectors)
+                                                               ──HTTPS─▶ OpenAI-compatible API
 ```
 
 ### Ingestion pipeline
 
-1. **Content hash.** SHA-256 of the uploaded bytes. Re-uploading identical content returns the stored result
-   (`200`, `"duplicate": true`) without calling the LLM.
-2. **Parsing.**
-   - Markdown is passed to the model as is. Markdown structure helps it, and the title comes from the first heading.
-   - PDF text is read per page in reading order. Visual content is collected per page:
-     - **Embedded raster images** of at least 100 px. Each unique image (by xref) is analysed once, even if it
-       repeats on several pages. Formats the vision API does not accept (JPX, JBIG2, CMYK) are re-encoded to PNG.
-     - **Scanned pages** (large image and almost no text layer) are rendered to PNG as a whole, so the vision
-       model OCRs them.
-     - **Vector graphics** (charts and diagrams drawn as paths, which are not images) are detected by the number
-       of drawing operations. Such a page is rendered and analysed as a whole.
-     - The number of vision calls per document is capped (`PDF_MAX_VISUAL_ITEMS`).
-3. **Vision.** Every visual goes to the vision model, with the page text as context. The model returns
-   `{is_relevant, description}` (Structured Output). Decorative images are dropped. Relevant descriptions are
-   appended to the page text as `[Visual content: …]`, so relations shown only in a diagram (for example a family
-   tree) are extracted like any other text.
-4. **Chunking.** Paragraph-aware packing (`CHUNK_SIZE_CHARS`, default 12 000) with overlapping trailing
-   paragraphs, so that relations described across a boundary are seen together.
-5. **Extraction.** Chunks are processed concurrently, bounded by `LLM_CONCURRENCY`. Each call uses OpenAI
-   Structured Outputs (`chat.completions.parse` with a Pydantic `response_format`, strict JSON schema), so the
-   response is validated before the pipeline sees it. Refusals, truncation and API errors become `502`. The
-   canonical relation vocabulary and the types already used in the graph are passed as preferred types.
-6. **In-article merge.** Characters from all chunks are merged only when the normalized name of one equals the name
-   or an alias of the other (name-anchored). Two characters that merely share an alias are not merged here: the
-   character judge decides that in step 7. Aliases that are possessive descriptors ("Ronald's father") are dropped.
-   Relations are rewritten to canonical names, typed (`UPPER_SNAKE_CASE`) and deduplicated. Relations that point to
-   unknown characters, that go through an alias claimed by two or more unmerged characters (ambiguous), and
-   self-loops, are dropped.
-7. **Resolution against the graph** (see [Deduplication](#deduplication-and-the-vector-index)). Only reads and LLM
-   calls, no writes, except the idempotent seed of the relation-type vocabulary.
-8. **Persistence.** The article is created as `processing`. Characters, mentions and relations are written, then
-   the article is marked `completed`. Every LLM call, including both judges, finishes before the first write, so an
-   LLM failure (502) leaves the graph unchanged except for the idempotent vocabulary seed. A Neo4j failure during
-   the writes deletes the article and its relations. Characters created or updated and relation types created
-   before the failure remain.
+1. **Content hash and claim.** SHA-256 of the uploaded bytes. Identical completed content returns the stored result
+   (`200`, `"duplicate": true`) with no LLM call. Right after parsing, the upload creates an `Article` in status
+   `processing`: this claims the hash. A concurrent retry gets `409` with the `article_id`. A claim older than
+   `STALE_PROCESSING_SECONDS` is treated as dead and reprocessed.
+2. **Parsing.** Markdown goes to the model as is. A PDF is read per page, and `MAX_PDF_PAGES` is checked first.
+   Visuals: embedded images of at least 100 px (each xref once; JPX, JBIG2 and CMYK are re-encoded to PNG), whole
+   scanned pages, and pages with many vector drawings (rendered whole). Renders and images are downscaled to
+   `PDF_MAX_RENDER_SIDE_PX`, and vision calls are capped by `PDF_MAX_VISUAL_ITEMS`.
+3. **Vision.** Each visual goes to the vision model, which returns `{is_relevant, description}`. Relevant
+   descriptions are appended to the page text as `[Visual content: …]`, so a relation shown only in a diagram is
+   extracted like any other. A visual the model cannot describe is skipped (logged); a backend outage fails the upload
+   with `502` so a retry redoes it; if all fail and there is no text: `502`.
+4. **Chunking.** Paragraph packing with overlap (`CHUNK_SIZE_CHARS`). A document needing more than `MAX_CHUNKS`
+   gets `422`, checked before any LLM call and again after vision.
+5. **Extraction.** Chunks run concurrently (`LLM_CONCURRENCY`) through Structured Outputs; refusals, truncation and
+   API errors become `502`. Known relation types are passed as preferred types.
+6. **In-article merge.** Characters merge only when one normalized name equals the name or an alias of the other.
+7. **Resolution against the graph** (see [Deduplication](#deduplication-and-the-vector-index)): reads and LLM calls
+   only, except the idempotent seed of the relation-type vocabulary.
+8. **Persistence in one transaction.** The article is completed (only while its claim is alive), characters are
+   written, then mentions, relation types and relations. Any failure rolls everything back and releases the claim.
+   A concurrent upload creating the same new character merges into it (`MERGE` on the unique `name_key`) without
+   repeating any paid call. A claim lost to a stale reprocess commits nothing and returns `503` or `409`.
 
 ### Deduplication and the vector index
 
-Both indexes are Neo4j native vector indexes (HNSW, cosine). Neo4j reports cosine similarity as
-`score = (1 + cos) / 2` ∈ [0, 1]; all scores below are on that scale.
+Both indexes are Neo4j native vector indexes (HNSW, cosine); scores use Neo4j's scale `(1 + cos) / 2` ∈ [0, 1].
 
-| Index                     | Node / property          | Embedded text                         | Used for                                               |
-|---------------------------|--------------------------|---------------------------------------|--------------------------------------------------------|
-| `character_embedding`     | `Character.embedding`    | `name (also known as …): description` | candidate characters for the judge                     |
-| `relation_type_embedding` | `RelationType.embedding` | `friend of` (from `FRIEND_OF`)        | candidate types for the judge, on write and on query   |
+| Index                     | Node / property          | Embedded text                         | Used for                                      |
+|---------------------------|--------------------------|---------------------------------------|-----------------------------------------------|
+| `character_embedding`     | `Character.embedding`    | `name (also known as …): description` | candidate characters for the judge            |
+| `relation_type_embedding` | `RelationType.embedding` | `friend of` (from `FRIEND_OF`)        | candidate types for the judge, on write       |
 
 **Why not thresholds.** Probes (hand-written pairs, `text-embedding-3-small`) gave Arthur ~ Molly Weasley 0.939,
 while true aliases scored 0.78–0.88. In a real run, different characters of the same story reached 0.87, and
 relation inverses (bullied by / bullies 0.867) sat inside the synonym range (0.83–0.92). No threshold separates
 them, so the index only retrieves candidates and an LLM decides.
 
-**Characters.**
+**Characters.** An exact canonical-name match merges directly. Otherwise the candidates are the union of stored
+characters sharing a name or alias, sharing an identifying name token, and the top `CHARACTER_CANDIDATE_LIMIT` vector
+neighbours (no score floor; k is the recall knob). One judge call per upload answers per character: `stored`,
+`same_as_new` or `new`. An invalid answer counts as `new`: a duplicate is cheaper than a wrong merge.
 
-1. An exact canonical-name match merges directly.
-2. Otherwise the candidates are the union of three channels: stored characters sharing a name or alias (`Weasley`);
-   stored characters sharing an identifying name token (honorifics are ignored); and the top
-   `CHARACTER_CANDIDATE_LIMIT` (10) vector neighbours, with no score floor. k is the recall knob.
-3. One judge call per upload sees all candidates and all new characters (references `S…` / `N…`), and answers per
-   character: `stored`, `same_as_new` or `new`. In-article duplicates from different chunks are caught there.
-4. Invalid answers (an unknown reference, a candidate that was not offered, a missing item) count as `new`: a
-   duplicate is cheaper than a wrong merge.
+**Relation types.** The canonical vocabulary is seeded on first use. An exact match is used directly; otherwise the
+top 5 neighbours with `score ≥ RELATION_TYPE_CANDIDATE_SCORE` go to one judge call, which maps only to the same or a
+more general type **in the same direction** (`FATHER_OF` → `PARENT_OF`; the nuance stays in the edge description).
+Only types used by a stored edge get a node.
 
-**Relation types.**
+**Inverses.** An inverse type from the extraction prompt (`Ron CHILD_OF Arthur`) is converted before the judge by
+swapping the ends, so none is stored, and an inverse is never offered to the judge as a candidate. Symmetric types
+(`FRIEND_OF`, `SIBLING_OF`, …) are stored once per pair, in the first-seen orientation.
 
-- The canonical vocabulary (`PARENT_OF`, `SIBLING_OF`, `MARRIED_TO`, `RELATIVE_OF`, `GUARDIAN_OF`, `FRIEND_OF`,
-  `ENEMY_OF`, `ROMANTIC_PARTNER_OF`, `WORKS_FOR`, `TEACHER_OF`, `MENTOR_OF`, `BULLIES`, `KILLED`, `PROTECTS`) is seeded
-  as `RelationType` nodes on first use.
-- An exact match is used directly.
-- Otherwise the top 5 neighbours with `score ≥ RELATION_TYPE_CANDIDATE_SCORE` (0.75) go to one judge call per upload.
-  The judge maps only to the same or a more general type **in the same direction**: inverses and opposites never
-  merge. A specific type collapses to the general one (`FATHER_OF` → `PARENT_OF`), and the nuance stays in the
-  relation `description`. The known inverse of a type is never offered as its candidate, so this holds in code and
-  not only in the prompt.
-- Only types used by stored edges get a node.
-- **Direction at extraction.** The extraction prompt may emit an inverse type (`Ron CHILD_OF Arthur`). Code converts it
-  deterministically before the judge, by swapping source and target (`Arthur PARENT_OF Ron`), so stored data is always
-  canonical and no inverse type is ever stored. Symmetric types (`FRIEND_OF`, `SIBLING_OF`, ...) are stored once per
-  pair, within an article and across articles, in the first-seen orientation. The inverse rule still holds for stored
-  data and the judge: stored edges are never re-oriented and an inverse is never merged with its counterpart.
+**Query.** `GET /relations/connected/{id}?type=…` resolves the type as: known inverse (`CHILD_OF` → `PARENT_OF` with
+the direction flipped) → exact stored or canonical name → the name with `_OF` appended (`friend` → `FRIEND_OF`) →
+`resolved_type: null`. It calls no LLM and writes nothing, so query with a name from `/relations/types`. For a
+symmetric type `direction` is ignored and every connection is reported as `outgoing`.
 
-**Query.** `GET /relations/connected/{id}?type=…` resolves the type in this order:
-
-1. a known inverse, checked first so that a stray stored `CHILD_OF` cannot hide the `PARENT_OF` edges
-   (`CHILD_OF` → `PARENT_OF`, `WARD_OF` → `GUARDIAN_OF`, `EMPLOYS` → `WORKS_FOR`,
-   `STUDENT_OF` → `TEACHER_OF`, `MENTEE_OF` → `MENTOR_OF`, `BULLIED_BY` → `BULLIES`, `KILLED_BY` → `KILLED`,
-   `PROTECTED_BY` → `PROTECTS`), answered with the direction flipped and no LLM call;
-2. exact match;
-3. vector candidates, then the judge;
-4. otherwise `resolved_type: null`.
-
-**Cost.** At most 2 extra small chat calls per upload (`gpt-4o-mini` by default; token usage is logged at INFO).
-A query costs one call only for a non-exact, non-inverse type.
+**Cost per upload.** One extraction call per chunk, one vision call per visual (at most `PDF_MAX_VISUAL_ITEMS`,
+`detail: high`), 2-3 embedding calls, at most 2 judge calls. Queries are free.
 
 ### Graph schema
 
@@ -149,26 +119,18 @@ A query costs one call only for a non-exact, non-inverse type.
 (:RelationType {name, embedding[], created_at})      // vocabulary of relation types
 ```
 
-| Element              | Constraint / index                                            |
-|----------------------|---------------------------------------------------------------|
-| `Article.id`         | unique                                                        |
-| `Article.content_hash` | unique (idempotent uploads, protects against parallel duplicates) |
-| `Character.id`       | unique                                                        |
-| `Character.name_key` | range index (exact name lookup)                               |
-| `Character.embedding` | vector index `character_embedding`                           |
-| `RelationType.name`  | unique                                                        |
-| `RelationType.embedding` | vector index `relation_type_embedding`                    |
-| `RELATED_TO.type`    | relationship property index                                   |
+| Element                  | Constraint / index                                          |
+|--------------------------|-------------------------------------------------------------|
+| `Article.id`, `Character.id`, `RelationType.name` | unique                       |
+| `Article.content_hash`   | unique (idempotent uploads; the claim of a hash)            |
+| `Character.name_key`     | **unique** (an exact name is one character, even under concurrent uploads) |
+| `Character.embedding`    | vector index `character_embedding`                          |
+| `RelationType.embedding` | vector index `relation_type_embedding`                      |
+| `RELATED_TO.type`        | relationship property index                                 |
 
-Design notes:
-
-- **The relation type is a property, not a Neo4j relationship type.** The vocabulary comes from the LLM and is
-  open-ended. Cypher cannot parameterize relationship types, so a dynamic type would mean string interpolation or
-  APOC. A property keeps every query parameterized and is indexed.
-- **Relations are directed** (`PARENT_OF` goes from parent to child). `connected` takes
-  `direction=any|outgoing|incoming`. One edge per `(source, type, target)` is kept, and `article_ids` lists the
-  articles where it was found.
-- IDs are UUIDs.
+The unique `name_key` constraint replaces an earlier index. A database that already holds duplicate keys fails at
+startup: re-ingest into a fresh volume. Relations are directed (`PARENT_OF` goes from parent to child); one edge per
+`(source, type, target)` is kept and `article_ids` lists the articles where it was found. IDs are UUIDs.
 
 ## API
 
@@ -177,24 +139,24 @@ Design notes:
 | POST   | `/auth/token`                                | —       | App Token → `{access_token, refresh_token}`         |
 | POST   | `/auth/refresh`                              | —       | refresh token → new pair                            |
 | POST   | `/articles/upload`                           | Bearer  | multipart: `text` (Markdown) **or** `file` (.md/.pdf), optional `title` |
+| GET    | `/articles/{article_id}`                     | Bearer  | status (`processing`, `stale`, `completed`) and, once completed, characters and relations |
 | GET    | `/characters?limit=&offset=`                 | Bearer  | all characters, sorted by name                      |
 | GET    | `/characters/by_article/{article_id}`        | Bearer  | characters mentioned in an article (`404` if unknown) |
 | GET    | `/relations/types`                           | Bearer  | unique relation types with counts                   |
 | GET    | `/relations/connected/{character_id}?type=&direction=` | Bearer | characters connected by a relation type |
-| GET    | `/health`                                    | —       | liveness + Neo4j connectivity                       |
+| GET    | `/health`                                    | —       | liveness + Neo4j connectivity (`503` when Neo4j is down) |
 
-Interactive docs: http://localhost:8000/docs.
-
-Upload error codes: `413` file too large (`MAX_UPLOAD_BYTES`, 20 MB by default), `415` unsupported file type,
-`422` unreadable or empty document, `409` identical content is being processed right now, `502` LLM backend error,
-`503` LLM not configured.
+Interactive docs: http://localhost:8000/docs. `/health`, `/docs` and `/openapi.json` are public on purpose.
+Error codes: `409` identical content is being processed (the body carries `article_id`); `413` upload too large
+(`MAX_UPLOAD_BYTES`); `415` unsupported file type; `422` unreadable or empty document, or over the page
+(`MAX_PDF_PAGES`) or chunk (`MAX_CHUNKS`) limit; `502` LLM backend error (generic message, details in the logs);
+`503` LLM not configured, or the upload was superseded by a stale reprocess (retry).
 
 ### Authentication
 
-App Tokens are configured in `APP_TOKENS` (comma-separated). They represent client applications, for example the
-main Django project. A client exchanges its App Token for a short-lived **access** token (15 min) and a
-**refresh** token (24 h). Both are HS256 JWTs with a `type` claim, so neither can be used in place of the other.
-Tokens carry a `jti` so that a revocation list can be added later; the prototype is stateless.
+App Tokens (`APP_TOKENS`, comma-separated) represent client applications such as the Django monolith. A client
+exchanges its App Token for an **access** token (15 min) and a **refresh** token (24 h). Both are HMAC-signed JWTs
+with a `type` claim, so neither can be used in place of the other. They carry a `jti` for a future denylist.
 
 ### curl examples
 
@@ -202,12 +164,8 @@ Tokens carry a `jti` so that a revocation list can be added later; the prototype
 BASE=http://localhost:8000
 
 # 1. Exchange the App Token for a token pair
-TOKENS=$(curl -s -X POST $BASE/auth/token \
-  -H 'Content-Type: application/json' \
+TOKENS=$(curl -s -X POST $BASE/auth/token -H 'Content-Type: application/json' \
   -d '{"app_token": "local-dev-app-token"}')
-echo "$TOKENS"
-# {"access_token":"eyJ...","refresh_token":"eyJ...","token_type":"bearer","expires_in":900,"refresh_expires_in":86400}
-
 ACCESS=$(echo "$TOKENS" | python3 -c 'import sys, json; print(json.load(sys.stdin)["access_token"])')
 REFRESH=$(echo "$TOKENS" | python3 -c 'import sys, json; print(json.load(sys.stdin)["refresh_token"])')
 AUTH="Authorization: Bearer $ACCESS"
@@ -220,43 +178,52 @@ curl -s -X POST $BASE/articles/upload -H "$AUTH" \
   -F 'text=# The Boy Who Lived
 
 Harry Potter lived with his aunt Petunia Dursley and uncle Vernon Dursley.
-On the Hogwarts Express Harry met Ron Weasley, who became his best friend.
-Hermione Granger soon became friends with both of them.'
+On the Hogwarts Express Harry met Ron Weasley, who became his best friend.'
 
 # 3b. Upload a Markdown or PDF file (title is optional)
-curl -s -X POST $BASE/articles/upload -H "$AUTH" -F 'file=@article.md'
 curl -s -X POST $BASE/articles/upload -H "$AUTH" -F 'file=@book.pdf' -F 'title=Chapter 1'
 # {"article_id":"6f1c…","title":"The Boy Who Lived","source_type":"markdown","duplicate":false,
 #  "characters":[{"id":"…","name":"Harry Potter","aliases":["Harry"],"description":"…"}, …],
-#  "relations":[{"source_id":"…","source_name":"Harry Potter","target_id":"…","target_name":"Ron Weasley",
-#                "type":"FRIEND_OF","description":"…"}, …]}
+#  "relations":[{"source_name":"Harry Potter","target_name":"Ron Weasley","type":"FRIEND_OF","description":"…"}, …]}
 
-# 4. All characters / characters of an article
+# 4. Article status and result; all characters; characters of an article; relation types
+curl -s $BASE/articles/<article_id> -H "$AUTH"
 curl -s $BASE/characters -H "$AUTH"
 curl -s $BASE/characters/by_article/<article_id> -H "$AUTH"
-
-# 5. Relation types
 curl -s $BASE/relations/types -H "$AUTH"
-# [{"type":"FRIEND_OF","count":3},{"type":"NEPHEW_OF","count":2}]
 
-# 6. Who is a friend of the character? (`type` accepts FRIEND_OF, "friend of", or a synonym)
-curl -s -G $BASE/relations/connected/<character_id> -H "$AUTH" --data-urlencode 'type=friend of'
-curl -s -G $BASE/relations/connected/<character_id> -H "$AUTH" -d type=PARENT_OF -d direction=outgoing
+# 5. Who is a friend of Harry? `type` accepts FRIEND_OF, "friend of" or "friend"
+HARRY=$(curl -s "$BASE/characters?limit=1000" -H "$AUTH" | python3 -c \
+  'import sys, json; print(next(c["id"] for c in json.load(sys.stdin) if c["name"] == "Harry Potter"))')
+curl -s -G $BASE/relations/connected/$HARRY -H "$AUTH" --data-urlencode 'type=friend of'
+curl -s -G $BASE/relations/connected/$HARRY -H "$AUTH" -d type=PARENT_OF -d direction=incoming
 # {"character_id":"…","requested_type":"friend of","resolved_type":"FRIEND_OF",
 #  "connections":[{"character":{"id":"…","name":"Ron Weasley",…},"direction":"outgoing","description":"…"}]}
 ```
 
+## Calling from Django
+
+- Call from a Celery task, not from a web worker (a PDF upload can take minutes), and store the returned `article_id`.
+- Retrying the same bytes is safe: `201` means new, `200` with `duplicate: true` means already done, and `409` with an
+  `article_id` means another request is in progress.
+- On `409`, poll `GET /articles/{id}`: `completed` means done; `stale` or `404` means that run died, so upload again.
+- Retry with backoff on `502` and on a `503` "superseded". A `503` "not configured", `413`, `415` and `422` are
+  permanent. Refresh the access token on `401`.
+
+```python
+token = requests.post(f"{BASE}/auth/token", json={"app_token": APP_TOKEN}, timeout=10).json()["access_token"]
+headers = {"Authorization": f"Bearer {token}"}
+requests.post(f"{BASE}/articles/upload", files={"file": ("a.pdf", pdf_bytes)}, headers=headers, timeout=600)
+```
+
 ## Sample articles
 
-`samples/01-two-families.md` and `samples/02-summer-at-the-burrow.md` exercise dedup end to end. Upload them in
-order with the `3b` command above (`-F 'file=@samples/01-two-families.md'`, then the second file), then inspect
-`GET /characters` and `GET /relations/types`.
-
-Expected outcome with a capable model:
-
-- one node each for Ron / Ronald, Harry / the Boy Who Lived and Voldemort / Tom Riddle;
-- separate Arthur, Molly and Percy;
-- family relations as `PARENT_OF` / `MARRIED_TO` / `RELATIVE_OF`, and no `*_BY` types.
+- `samples/01-two-families.md` and `samples/02-summer-at-the-burrow.md` exercise dedup: upload them in order. Expected
+  with a capable model: one node each for Ron / Ronald, Harry / the Boy Who Lived and Voldemort / Tom Riddle; separate
+  Arthur, Molly and Percy; family relations as `PARENT_OF` / `MARRIED_TO` / `RELATIVE_OF`, and no `*_BY` types.
+- `samples/03-bakery-chart.pdf` exercises the vision path: its relations appear only in the embedded chart.
+  Expected edges: `Elena Varga PARENT_OF Mateo Rossi` and `Ivo Petrov WORKS_FOR Elena Varga` (the text states neither).
+  Upload with `-F 'file=@samples/03-bakery-chart.pdf'`; regenerate with `.venv/bin/python scripts/make_sample_pdf.py`.
 
 ## Prompts
 
@@ -447,18 +414,30 @@ All settings are environment variables (see [`app/core/config.py`](app/core/conf
 |---|---|---|
 | `APP_TOKENS` | — (compose: `local-dev-app-token`) | comma-separated App Tokens |
 | `JWT_SECRET` | — (compose: dev value) | ≥ 32 chars |
+| `JWT_ALGORITHM` | `HS256` | `HS256`, `HS384` or `HS512` |
 | `ACCESS_TOKEN_TTL_SECONDS` / `REFRESH_TOKEN_TTL_SECONDS` | 900 / 86400 | |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | — | any OpenAI-compatible backend |
+| `NEO4J_DATABASE` | `neo4j` | |
 | `LLM_MODEL` | `gpt-4.1-mini` | extraction model; must support Structured Outputs |
 | `VISION_MODEL` | `gpt-4o-mini` | must accept images |
 | `JUDGE_MODEL` | `gpt-4o-mini` | must support Structured Outputs |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | `text-embedding-3-small` / 1536 | changing the dimension requires a fresh database (the vector index is created with it) |
 | `LLM_CONCURRENCY` | 4 | parallel LLM calls per process |
+| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` | 120 / 3 | per LLM call |
+| `MAX_UPLOAD_BYTES` | 20971520 | larger uploads get 413 |
+| `MAX_PDF_PAGES` / `MAX_CHUNKS` | 100 / 50 | more pages or chunks get 422 (chunks are checked before any LLM call) |
+| `STALE_PROCESSING_SECONDS` | 1800 | a `processing` claim older than this is treated as dead and reprocessed |
 | `CHUNK_SIZE_CHARS` / `CHUNK_OVERLAP_CHARS` | 12000 / 800 | |
 | `PDF_MAX_VISUAL_ITEMS` | 30 | cap on vision calls per document |
+| `PDF_MIN_IMAGE_SIDE_PX` / `PDF_RENDER_DPI` | 100 / 150 | smaller embedded images are ignored; DPI of page renders |
+| `PDF_MAX_RENDER_SIDE_PX` | 2048 | renders and embedded images are downscaled to this side |
+| `PDF_SCANNED_PAGE_MAX_CHARS` / `PDF_DRAWINGS_RENDER_THRESHOLD` | 50 / 30 | a page with fewer characters counts as scanned; one with more drawings is rendered whole |
 | `CHARACTER_CANDIDATE_LIMIT` | 10 | vector candidates per new character (recall knob) |
 | `RELATION_TYPE_CANDIDATE_SCORE` | 0.75 | Neo4j score scale |
 | `API_PORT` / `NEO4J_HTTP_PORT` / `NEO4J_BOLT_PORT` | 8000 / 7474 / 7687 | host ports (compose) |
+
+Every variable is passed through `docker-compose.yml`. The app logs a warning at startup while the dev `JWT_SECRET` or
+`APP_TOKENS` is in use.
 
 Stronger models (e.g. `gpt-4o`) for `LLM_MODEL` and `JUDGE_MODEL` improve extraction and dedup quality at a higher cost.
 
@@ -468,45 +447,34 @@ inverted none, at similar token counts. This is a small sample, so treat it as a
 
 ## Tests
 
+Python 3.12+ and Docker are required.
+
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/pytest
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt && .venv/bin/pytest
 ```
 
-- **Unit tests** (`tests/unit`): chunking, name and type normalization, in-article merging, PDF parsing
-  (text, embedded images, scanned pages, vector graphics, image dedup, cap), the OpenAI client (structured output
-  request, refusal handling, base64 images, embedding order), settings, judge verdict grouping, vocabulary and
-  prompt consistency, and the README/prompt sync.
-- **Integration tests** (`tests/integration`) start a real Neo4j 5.26 via
-  [testcontainers](https://testcontainers.com/), so Docker must be running. They go through the HTTP API, with the
-  LLM replaced by a deterministic fake (bag-of-words embeddings). They check auth (pair issue, refresh, wrong token
-  type, expiry, every protected route), uploads (Markdown text and file, PDF with images, duplicates, validation
-  errors, rollback on LLM failure), and every read endpoint. Persistence is checked **directly in Neo4j** with a
-  separate driver: nodes, `MENTIONS` and `RELATED_TO` edges, embeddings, candidate retrieval and LLM-judge dedup of
-  characters and relation types (a deterministic fake judge declares which names are the same, so the tests prove the
-  decision path, not model quality), inverse queries, and rollback on judge failure.
-- To use an already running Neo4j instead: `TEST_NEO4J_URI=bolt://localhost:7687 TEST_NEO4J_PASSWORD=… pytest`.
-  **The tests wipe that database.**
+- **Unit tests** (`tests/unit`): chunking, normalization, in-article merging, PDF parsing and its limits, the OpenAI
+  client, settings, compose/`.env.example`/README completeness, verdict grouping, prompt and README sync, and the
+  generated sample PDF.
+- **Integration tests** (`tests/integration`) start a real Neo4j 5.26 via [testcontainers](https://testcontainers.com/)
+  and go through the HTTP API, with the LLM replaced by a deterministic fake. They check auth, uploads (PDF with images,
+  duplicates, in-progress claims, stale reclaim, lost claim, concurrent creation of one character, rollback of a failed
+  write, failed visuals), `GET /articles/{id}`, every read endpoint (no LLM call on a query) and the schema migration.
+  Persistence is checked **directly in Neo4j**; the fake judge proves the decision path, not model quality.
+- To use a running Neo4j: `TEST_NEO4J_URI=bolt://localhost:7687 TEST_NEO4J_PASSWORD=… pytest`. **The tests wipe it.**
 
 ## Limitations and next steps
 
-- **Processing is synchronous within the request.** That is enough for a prototype and keeps the API simple, but a
-  long PDF can take a minute. For production: return `202` with the article in `processing` status, run the
-  pipeline in a worker (Celery/arq/Temporal), and add `GET /articles/{id}`. The status field and idempotency by
-  content hash are already in place for this.
-- **Concurrent uploads that introduce the same new character** can, rarely, create it twice. This needs a
-  per-name lock or a periodic merge job.
+- **Upload is synchronous.** For production return `202`, run the pipeline in a worker (Celery/arq/Temporal) and poll
+  `GET /articles/{id}`; today a client polls it after a `409`. The claim and the content hash are already in place.
 - **Recall is bounded by the candidate channels.** An alias with no shared name token that ranks outside the vector
   top-k is never judged, and becomes a duplicate.
+- **The extraction prompt's examples use the sample cast**: neutral ones regressed dedup on the live run, so they stay.
 - **Existing data is not re-resolved.** Earlier wrong merges or types stay until re-ingested into a fresh database.
-- **In-article merging** is name-anchored and does not use the judge. Characters sharing only an alias stay separate
-  and are left to the character judge; a relation that names such an ambiguous alias is dropped rather than guessed.
-  Possessive descriptor aliases ("Ronald's father") are dropped, which would also drop a legitimate alias containing
-  `'s` (rare for names; logged at INFO).
-- **Only the listed inverses are answered on query.** A paraphrased inverse such as `son of` resolves to nothing.
-- **One judge call per upload is not split.** Very large articles produce one large prompt.
-- **Symmetric relations** (`FRIEND_OF`) are stored once, in the direction first emitted. Queries use
-  `direction=any` by default, so this does not affect lookups.
-- **Refresh tokens** are not rotated with revocation (stateless JWT). The `jti` claim is there to add a denylist.
-- The `text` form field is limited to 1 MB by Starlette's multipart parser; upload larger Markdown as a file.
-- Markdown image links are not fetched, which avoids SSRF. Only images embedded in PDFs are analysed.
+- **A merged character's embedding is not recomputed.** Concurrent merges into one character can overwrite aliases.
+- **In-article merging** is name-anchored and does not use the judge; a relation that names an ambiguous alias is
+  dropped rather than guessed. Possessive aliases ("Ronald's father") are dropped.
+- **Queries resolve a type only through the inverse map, the exact name or the `_OF` suffix.** A paraphrase such as
+  `son of` resolves to nothing: no LLM runs on a GET. `direction` is ignored for symmetric types (`FRIEND_OF`).
+- **The upload size is checked after the body is received**, so put a body limit on the reverse proxy.
+- The `text` form field is limited to 1 MB by Starlette; upload larger Markdown as a file.

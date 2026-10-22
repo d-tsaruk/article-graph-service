@@ -1,7 +1,10 @@
-from typing import Annotated
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+DEV_APP_TOKEN = "local-dev-app-token"
+DEV_JWT_SECRET = "local-dev-jwt-secret-change-me-0123456789"
 
 
 class Settings(BaseSettings):
@@ -11,7 +14,7 @@ class Settings(BaseSettings):
         description="Comma-separated App Tokens that may be exchanged for JWTs"
     )
     jwt_secret: SecretStr
-    jwt_algorithm: str = "HS256"
+    jwt_algorithm: Literal["HS256", "HS384", "HS512"] = "HS256"
     access_token_ttl_seconds: int = Field(default=15 * 60, gt=0)
     refresh_token_ttl_seconds: int = Field(default=24 * 60 * 60, gt=0)
 
@@ -34,16 +37,27 @@ class Settings(BaseSettings):
     max_upload_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
     chunk_size_chars: int = Field(default=12_000, gt=0)
     chunk_overlap_chars: int = Field(default=800, ge=0)
+    max_pdf_pages: int = Field(default=100, gt=0)
+    max_chunks: int = Field(default=50, gt=0)
+    # An upload claims its content hash for the whole LLM run; a claim older than this is considered dead.
+    stale_processing_seconds: int = Field(default=1800, gt=0)
 
     pdf_max_visual_items: int = Field(default=30, ge=0)
     pdf_min_image_side_px: int = Field(default=100, gt=0)
     pdf_render_dpi: int = Field(default=150, gt=0)
+    pdf_max_render_side_px: int = Field(default=2048, gt=0)
     pdf_scanned_page_max_chars: int = Field(default=50, ge=0)
     pdf_drawings_render_threshold: int = Field(default=30, gt=0)
 
     character_candidate_limit: int = Field(default=10, gt=0)
     # On Neo4j's cosine score scale: score = (1 + cos) / 2.
     relation_type_candidate_score: float = Field(default=0.75, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _overlap_below_chunk_size(self) -> Self:
+        if self.chunk_overlap_chars >= self.chunk_size_chars:
+            raise ValueError("CHUNK_OVERLAP_CHARS must be smaller than CHUNK_SIZE_CHARS")
+        return self
 
     @field_validator("openai_api_key", mode="before")
     @classmethod

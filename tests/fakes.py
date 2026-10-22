@@ -24,9 +24,12 @@ class FakeLLMClient:
         self.embedding_dimensions = embedding_dimensions
         self.extraction: ExtractionResult | ExtractionFactory = ExtractionResult(characters=[], relations=[])
         self.image_analysis = ImageAnalysis(is_relevant=True, description="An illustration.")
+        # When set, each analyze_image call consumes the first item and raises it if it is an exception.
+        self.image_results: list[ImageAnalysis | Exception] | None = None
         # Lets a test declare two phrases as synonyms, e.g. {"friends with": "friend of"}.
         self.embedding_overrides: dict[str, str] = {}
         self.extract_calls: list[tuple[str, list[str]]] = []
+        self.embed_calls: list[list[str]] = []
         self.image_calls: list[tuple[bytes, str, str]] = []
         # Each set holds names (canonical or alias) of ONE individual; cards sharing a set are "the same".
         self.same_characters: list[set[str]] = []
@@ -44,9 +47,15 @@ class FakeLLMClient:
 
     async def analyze_image(self, image: bytes, mime_type: str, context: str) -> ImageAnalysis:
         self.image_calls.append((image, mime_type, context))
+        if self.image_results is not None:
+            result = self.image_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         return self.image_analysis
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.embed_calls.append(texts)
         return [
             hashed_bag_of_words(self.embedding_overrides.get(text, text), self.embedding_dimensions) for text in texts
         ]

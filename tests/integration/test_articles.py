@@ -1,8 +1,14 @@
+import logging
+
 import neo4j
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import Settings
+from app.llm.base import LLMError, LLMNotConfiguredError, LLMUnavailableError
 from app.llm.schemas import ImageAnalysis
 from app.llm.vocabulary import CANONICAL_RELATION_TYPES
+from app.main import create_app
 from tests.factories import (
     HARRY_DESCRIPTION,
     HERMIONE_DESCRIPTION,
@@ -11,6 +17,7 @@ from tests.factories import (
     character,
     extraction,
     harry_and_ron,
+    insert_processing_article,
     relation,
 )
 from tests.fakes import FakeLLMClient
@@ -231,8 +238,6 @@ def test_corrupted_pdf_is_rejected(client: TestClient, auth_headers: dict[str, s
 def test_failed_extraction_leaves_no_article(
     client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
 ) -> None:
-    from app.llm.base import LLMError
-
     def fail(_: str):
         raise LLMError("model refused")
 
@@ -243,6 +248,111 @@ def test_failed_extraction_leaves_no_article(
     assert response.status_code == 502
     records, _, _ = db.execute_query("MATCH (a:Article) RETURN count(a) AS n")
     assert records[0]["n"] == 0
+
+
+def test_llm_error_text_is_not_returned_to_the_client(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    def fail(_: str):
+        raise LLMError("org-secret-123")
+
+    fake_llm.extraction = fail
+
+    response = client.post("/articles/upload", data={"text": MARKDOWN}, headers=auth_headers)
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "LLM backend error"}
+    assert "org-secret-123" not in response.text
+
+
+def upload_pdf(client: TestClient, headers: dict[str, str], pdf: bytes, title: str | None = None):
+    return client.post(
+        "/articles/upload",
+        files={"file": ("book.pdf", pdf, "application/pdf")},
+        data={"title": title} if title else None,
+        headers=headers,
+    )
+
+
+def article_count(db: neo4j.Driver) -> int:
+    records, _, _ = db.execute_query("MATCH (a:Article) RETURN count(a) AS n")
+    return records[0]["n"]
+
+
+def test_one_failed_visual_is_skipped(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm: FakeLLMClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_llm.image_results = [
+        LLMError("refused"),
+        ImageAnalysis(is_relevant=True, description="Chart: Anna mother of Boris"),
+    ]
+    fake_llm.extraction = harry_and_ron()
+    pdf = build_pdf(
+        [
+            {"text": "Page one text.", "image_size": (300, 300)},
+            {"text": "Page two text.", "image_size": (320, 310)},
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.pipeline.ingestion"):
+        response = upload_pdf(client, auth_headers, pdf, title="book")
+
+    assert response.status_code == 201, response.text
+    assert "Chart: Anna mother of Boris" in fake_llm.extract_calls[0][0]
+    assert "book" in caplog.text and "page 1" in caplog.text and "skipped" in caplog.text
+    assert "1 of 2 visuals skipped" in caplog.text
+
+
+def test_failed_only_visual_with_page_text_is_skipped(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    fake_llm.image_results = [LLMError("x")]
+    fake_llm.extraction = harry_and_ron()
+    pdf = build_pdf([{"text": "Only the page text.", "image_size": (300, 300)}])
+
+    response = upload_pdf(client, auth_headers, pdf)
+
+    assert response.status_code == 201, response.text
+    assert fake_llm.extract_calls[0][0] == "Only the page text."
+
+
+def test_all_visuals_failing_without_text_returns_502(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.image_results = [LLMError("x")]
+    pdf = build_pdf([{"image_size": (600, 800)}])
+
+    response = upload_pdf(client, auth_headers, pdf)
+
+    assert response.status_code == 502
+    assert article_count(db) == 0
+
+
+def test_unconfigured_vision_is_still_503(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    fake_llm.image_results = [LLMNotConfiguredError("x")]
+    pdf = build_pdf([{"text": "Some text.", "image_size": (300, 300)}])
+
+    assert upload_pdf(client, auth_headers, pdf).status_code == 503
+
+
+def test_too_many_chunks_is_rejected_before_any_llm_call(
+    settings: Settings, fake_llm: FakeLLMClient, db: neo4j.Driver, auth_headers: dict[str, str]
+) -> None:
+    limited = settings.model_copy(update={"max_chunks": 1, "chunk_size_chars": 100, "chunk_overlap_chars": 10})
+    text = "\n\n".join(f"Paragraph {i} " + "word " * 14 for i in range(3))
+
+    with TestClient(create_app(limited, llm_client=fake_llm)) as limited_client:
+        response = limited_client.post("/articles/upload", data={"text": text}, headers=auth_headers)
+
+    assert response.status_code == 422
+    assert "MAX_CHUNKS" in response.json()["detail"]
+    assert fake_llm.extract_calls == []
+    assert article_count(db) == 0
 
 
 def friend_edges(db: neo4j.Driver) -> list[tuple[str, str, list[str]]]:
@@ -299,3 +409,82 @@ def test_synonym_mapped_to_a_symmetric_type_dedupes_against_the_reverse_edge(
     body = upload_markdown(client, auth_headers)
 
     assert friend_edges(db) == [("Harry Potter", "Ron Weasley", [body["article_id"]])]
+
+
+def test_get_article_returns_status_and_result(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient
+) -> None:
+    fake_llm.extraction = harry_and_ron()
+    uploaded = upload_markdown(client, auth_headers)
+
+    response = client.get(f"/articles/{uploaded['article_id']}", headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["characters"] == uploaded["characters"]
+    assert body["relations"] == uploaded["relations"]
+
+
+def test_get_processing_article(client: TestClient, auth_headers: dict[str, str], db: neo4j.Driver) -> None:
+    insert_processing_article(db)
+
+    body = client.get("/articles/busy", headers=auth_headers).json()
+
+    assert body["status"] == "processing"
+    assert body["characters"] == []
+    assert body["relations"] == []
+
+
+def test_get_stale_article(client: TestClient, auth_headers: dict[str, str], db: neo4j.Driver) -> None:
+    insert_processing_article(db, age_minutes=40)
+
+    assert client.get("/articles/busy", headers=auth_headers).json()["status"] == "stale"
+
+
+def test_get_unknown_article_returns_404(client: TestClient, auth_headers: dict[str, str]) -> None:
+    assert client.get("/articles/missing", headers=auth_headers).status_code == 404
+
+
+def test_oversized_upload_returns_413(
+    settings: Settings, fake_llm: FakeLLMClient, db: neo4j.Driver, auth_headers: dict[str, str]
+) -> None:
+    small = settings.model_copy(update={"max_upload_bytes": 10})
+
+    with TestClient(create_app(small, llm_client=fake_llm)) as small_client:
+        response = small_client.post("/articles/upload", data={"text": "x" * 11}, headers=auth_headers)
+
+    assert response.status_code == 413
+
+
+def test_embedding_count_mismatch_on_upload_returns_502(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.extraction = harry_and_ron()
+
+    async def broken_embed(texts: list[str]) -> list[list[float]]:
+        return []
+
+    fake_llm.embed = broken_embed  # type: ignore[method-assign]
+
+    response = client.post("/articles/upload", data={"text": MARKDOWN}, headers=auth_headers)
+
+    assert response.status_code == 502
+    assert article_count(db) == 0
+
+
+def test_vision_outage_fails_the_upload_and_releases_the_claim(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.image_results = [LLMUnavailableError("rate limited")]
+    fake_llm.extraction = harry_and_ron()
+    pdf = build_pdf([{"text": "Page text.", "image_size": (300, 300)}])
+
+    response = upload_pdf(client, auth_headers, pdf)
+
+    assert response.status_code == 502
+    assert fake_llm.extract_calls == []
+    assert article_count(db) == 0
+
+    fake_llm.image_results = [ImageAnalysis(is_relevant=True, description="Chart: Anna mother of Boris")]
+    assert upload_pdf(client, auth_headers, pdf).status_code == 201
