@@ -89,6 +89,9 @@ them, so the index only retrieves candidates and an LLM decides.
 characters sharing a name or alias, sharing an identifying name token, and the top `CHARACTER_CANDIDATE_LIMIT` vector
 neighbours (no score floor; k is the recall knob). One judge call per upload answers per character: `stored`,
 `same_as_new` or `new`. An invalid answer counts as `new`: a duplicate is cheaper than a wrong merge.
+A deterministic guard backs the judge: two characters whose full names share a surname but not a given name
+(`Percy Weasley` / `Ron Weasley`) are never offered to it as a pair, and a `same_as_new` between them counts as `new`;
+a given name that prefixes the other (`Ron` / `Ronald`) is not a conflict. The live judge did merge siblings without it.
 
 **Relation types.** The canonical vocabulary is seeded on first use. An exact match is used directly; otherwise the
 top 5 neighbours with `score ≥ RELATION_TYPE_CANDIDATE_SCORE` go to one judge call, which maps only to the same or a
@@ -470,6 +473,10 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt && .ve
 - **Recall is bounded by the candidate channels.** An alias with no shared name token that ranks outside the vector
   top-k is never judged, and becomes a duplicate.
 - **The extraction prompt's examples use the sample cast**: neutral ones regressed dedup on the live run, so they stay.
+- **One relation per pair from the extraction model.** gpt-4.1-mini tends to keep only the most salient relation of
+  a pair: `Dudley BULLIES Harry` is extracted but `Dudley RELATIVE_OF Harry` (cousins) is not. Asking for both in the
+  prompt fixed it on the live run but traded it for other errors (a false `KILLED` edge), so the prompt stays.
+- **Same surname, different given name never merges**, so `Bill Weasley` / `William Weasley` stay apart.
 - **Existing data is not re-resolved.** Earlier wrong merges or types stay until re-ingested into a fresh database.
 - **A merged character's embedding is not recomputed.** Concurrent merges into one character can overwrite aliases.
 - **In-article merging** is name-anchored and does not use the judge; a relation that names an ambiguous alias is

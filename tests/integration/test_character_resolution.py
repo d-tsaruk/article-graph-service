@@ -69,11 +69,47 @@ def test_family_members_sharing_a_surname_stay_separate(
     first: ExtractedCharacter,
     second: ExtractedCharacter,
 ) -> None:
+    fake_llm.same_characters = [{first.name, second.name}]  # a judge that wrongly merges them
     upload(client, auth_headers, fake_llm, [first], text="first")
     upload(client, auth_headers, fake_llm, [second], text="second")
 
-    assert first.name in offered_names(fake_llm, second.name)
+    assert fake_llm.character_judge_calls == []  # the stored sibling is never even offered
     assert count(db, "Character") == 2
+
+
+def test_new_characters_with_conflicting_names_are_not_merged_by_the_judge(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm: FakeLLMClient,
+    db: neo4j.Driver,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_llm.same_characters = [{"Ron Weasley", "Percy Weasley"}]
+
+    upload(
+        client,
+        auth_headers,
+        fake_llm,
+        [character("Ron Weasley", RON_DESCRIPTION), character("Percy Weasley", "Ron's older brother, a prefect")],
+        text="one article",
+    )
+
+    records, _, _ = db.execute_query("MATCH (c:Character) RETURN c.name AS name ORDER BY name")
+    assert [r["name"] for r in records] == ["Percy Weasley", "Ron Weasley"]
+    assert "conflicting names" in caplog.text
+
+
+def test_given_name_prefix_is_not_a_conflict(
+    client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
+) -> None:
+    fake_llm.same_characters = [{"Ronald Weasley", "Ron Weasley"}]
+    upload(client, auth_headers, fake_llm, [character("Ronald Weasley", RON_DESCRIPTION)], text="first")
+
+    upload(client, auth_headers, fake_llm, [character("Ron Weasley", "Harry's best friend")], text="second")
+
+    assert offered_names(fake_llm, "Ron Weasley") == ["Ronald Weasley"]
+    records, _, _ = db.execute_query("MATCH (c:Character) RETURN c.name AS name, c.aliases AS aliases")
+    assert [(r["name"], r["aliases"]) for r in records] == [("Ronald Weasley", ["Ron Weasley"])]
 
 
 @pytest.mark.parametrize(
@@ -158,11 +194,11 @@ def test_alias_collision_goes_to_judge(
         client,
         auth_headers,
         fake_llm,
-        [character("Ginny Weasley", "Ron's sister", aliases=("Weasley",))],
+        [character("Mr. Weasley", "Ron's father", aliases=("Weasley",))],
         text="second",
     )
 
-    assert "Ron Weasley" in offered_names(fake_llm, "Ginny Weasley")
+    assert "Ron Weasley" in offered_names(fake_llm, "Mr. Weasley")
     assert count(db, "Character") == 2
 
 
@@ -181,10 +217,10 @@ def test_lexical_candidate_is_offered_beyond_vector_top_k(
             text="stored",
         )
 
-        upload(client, headers, fake_llm, [character("Lily Potter", HERMIONE_DESCRIPTION)], text="new")
+        upload(client, headers, fake_llm, [character("Mrs. Potter", HERMIONE_DESCRIPTION)], text="new")
 
     # Lexical channel first (shares "potter"), then the single vector neighbour.
-    assert offered_names(fake_llm, "Lily Potter") == ["James Potter", "Hermione Granger"]
+    assert offered_names(fake_llm, "Mrs. Potter") == ["James Potter", "Hermione Granger"]
 
 
 def test_exact_canonical_name_skips_judge(

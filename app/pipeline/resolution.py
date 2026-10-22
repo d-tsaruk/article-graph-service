@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from app.graph.repository import CharacterRecord, GraphRepository, GraphWriter
 from app.llm.base import LLMClient, LLMError
 from app.llm.judging import CharacterCard, RelationTypeCard
-from app.llm.schemas import ExtractedCharacter
+from app.llm.schemas import ExtractedCharacter, Judgement, Verdict
 from app.llm.vocabulary import CANONICAL_RELATION_TYPES, INVERSE_RELATION_TYPES
 from app.pipeline.adjudication import group_verdicts
 from app.pipeline.merging import MAX_DESCRIPTION_CHARS
-from app.pipeline.normalization import identifying_tokens, name_key, relation_type_phrase
+from app.pipeline.normalization import identifying_tokens, name_key, names_conflict, relation_type_phrase
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,29 @@ async def _embed(llm: LLMClient, texts: list[str]) -> list[list[float]]:
     return embeddings
 
 
+def _without_conflicting_merges(judgement: Judgement, new: dict[str, ExtractedCharacter]) -> Judgement:
+    """A same_as_new verdict between two new characters with conflicting names is turned into "new"."""
+    verdicts = []
+    for verdict in judgement.verdicts:
+        other = new.get(verdict.match or "")
+        character = new.get(verdict.item)
+        if (
+            verdict.decision == "same_as_new"
+            and character is not None
+            and other is not None
+            and names_conflict([character.name, *character.aliases], [other.name, *other.aliases])
+        ):
+            logger.warning(
+                "character judge: %r and %r have conflicting names (reason: %s); treated as new",
+                character.name,
+                other.name,
+                verdict.reason,
+            )
+            verdict = Verdict(item=verdict.item, reason=verdict.reason, decision="new", match=None)
+        verdicts.append(verdict)
+    return Judgement(verdicts=verdicts)
+
+
 def _are_inverse(left: str, right: str) -> bool:
     return INVERSE_RELATION_TYPES.get(left) == right or INVERSE_RELATION_TYPES.get(right) == left
 
@@ -83,7 +106,10 @@ class CharacterResolver:
         if not pending:
             return plan
 
-        found = [await self._candidates(character, embedding) for character, embedding in pending]
+        found = [
+            self._without_conflicting(character, await self._candidates(character, embedding))
+            for character, embedding in pending
+        ]
         records = {record.id: record for candidates in found for record in candidates}
         known_refs = {record_id: f"S{i}" for i, record_id in enumerate(records, 1)}
         new_refs = [f"N{i}" for i in range(1, len(pending) + 1)]
@@ -102,6 +128,8 @@ class CharacterResolver:
             )
 
         by_ref = dict(zip(new_refs, pending, strict=True))
+        if judgement is not None:
+            judgement = _without_conflicting_merges(judgement, {ref: c for ref, (c, _) in by_ref.items()})
         record_by_ref = {ref: records[record_id] for record_id, ref in known_refs.items()}
         labels = {ref: c.name for ref, (c, _) in by_ref.items()} | {ref: r.name for ref, r in record_by_ref.items()}
         for group in group_verdicts(candidates, judgement, kind="character", labels=labels):
@@ -141,6 +169,22 @@ class CharacterResolver:
             [m.character for m in await self._repository.find_similar_characters(embedding, self._candidate_limit)],
         ]
         return list({record.id: record for channel in channels for record in channel}.values())
+
+    @staticmethod
+    def _without_conflicting(character: ExtractedCharacter, records: list[CharacterRecord]) -> list[CharacterRecord]:
+        """Drops stored characters that share a surname with `character` but have an incompatible given name."""
+        names = [character.name, *character.aliases]
+        kept = []
+        for record in records:
+            if names_conflict(names, [record.name, *record.aliases]):
+                logger.info(
+                    "Not offering %r as a candidate for %r: same surname, different given name",
+                    record.name,
+                    character.name,
+                )
+            else:
+                kept.append(record)
+        return kept
 
     async def _create(
         self, character: ExtractedCharacter, embedding: list[float], writer: GraphWriter
