@@ -99,6 +99,66 @@ def test_new_characters_with_conflicting_names_are_not_merged_by_the_judge(
     assert "conflicting names" in caplog.text
 
 
+def test_judge_group_cannot_smuggle_a_conflicting_name_into_a_stored_character(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm: FakeLLMClient,
+    db: neo4j.Driver,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    upload(
+        client,
+        auth_headers,
+        fake_llm,
+        [character("Ron Weasley", RON_DESCRIPTION, aliases=("Ron",))],
+        text="first",
+    )
+    fake_llm.same_characters = [{"Ron Weasley", "Ronald", "Percy Weasley"}]
+
+    upload(
+        client,
+        auth_headers,
+        fake_llm,
+        [character("Ronald", RON_DESCRIPTION), character("Percy Weasley", "Ron's older brother, a prefect")],
+        text="second",
+    )
+
+    records, _, _ = db.execute_query("MATCH (c:Character) RETURN c.name AS name, c.aliases AS aliases ORDER BY name")
+    assert [(r["name"], set(r["aliases"])) for r in records] == [
+        ("Percy Weasley", set()),
+        ("Ron Weasley", {"Ron", "Ronald"}),
+    ]
+    assert "conflicting names" in caplog.text
+    assert "Percy Weasley" in caplog.text
+    assert "Ron Weasley" in caplog.text
+
+
+def test_judge_chain_cannot_merge_conflicting_names_through_a_bridge(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm: FakeLLMClient,
+    db: neo4j.Driver,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_llm.same_characters = [{"Ron Weasley", "Ronald", "Percy Weasley"}]
+
+    upload(
+        client,
+        auth_headers,
+        fake_llm,
+        [
+            character("Ronald", RON_DESCRIPTION),
+            character("Ron Weasley", RON_DESCRIPTION),
+            character("Percy Weasley", "Ron's older brother, a prefect"),
+        ],
+        text="one article",
+    )
+
+    records, _, _ = db.execute_query("MATCH (c:Character) RETURN c.name AS name, c.aliases AS aliases ORDER BY name")
+    assert [(r["name"], r["aliases"]) for r in records] == [("Percy Weasley", []), ("Ronald", ["Ron Weasley"])]
+    assert "conflicting names" in caplog.text
+
+
 def test_given_name_prefix_is_not_a_conflict(
     client: TestClient, auth_headers: dict[str, str], fake_llm: FakeLLMClient, db: neo4j.Driver
 ) -> None:

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from app.graph.repository import CharacterRecord, GraphRepository, GraphWriter
 from app.llm.base import LLMClient, LLMError
 from app.llm.judging import CharacterCard, RelationTypeCard
-from app.llm.schemas import ExtractedCharacter, Judgement, Verdict
+from app.llm.schemas import ExtractedCharacter
 from app.llm.vocabulary import CANONICAL_RELATION_TYPES, INVERSE_RELATION_TYPES
 from app.pipeline.adjudication import group_verdicts
 from app.pipeline.merging import MAX_DESCRIPTION_CHARS
@@ -51,29 +51,6 @@ async def _embed(llm: LLMClient, texts: list[str]) -> list[list[float]]:
     if len(embeddings) != len(texts):
         raise LLMError(f"embedding backend returned {len(embeddings)} vectors for {len(texts)} texts")
     return embeddings
-
-
-def _without_conflicting_merges(judgement: Judgement, new: dict[str, ExtractedCharacter]) -> Judgement:
-    """A same_as_new verdict between two new characters with conflicting names is turned into "new"."""
-    verdicts = []
-    for verdict in judgement.verdicts:
-        other = new.get(verdict.match or "")
-        character = new.get(verdict.item)
-        if (
-            verdict.decision == "same_as_new"
-            and character is not None
-            and other is not None
-            and names_conflict([character.name, *character.aliases], [other.name, *other.aliases])
-        ):
-            logger.warning(
-                "character judge: %r and %r have conflicting names (reason: %s); treated as new",
-                character.name,
-                other.name,
-                verdict.reason,
-            )
-            verdict = Verdict(item=verdict.item, reason=verdict.reason, decision="new", match=None)
-        verdicts.append(verdict)
-    return Judgement(verdicts=verdicts)
 
 
 def _are_inverse(left: str, right: str) -> bool:
@@ -128,20 +105,35 @@ class CharacterResolver:
             )
 
         by_ref = dict(zip(new_refs, pending, strict=True))
-        if judgement is not None:
-            judgement = _without_conflicting_merges(judgement, {ref: c for ref, (c, _) in by_ref.items()})
         record_by_ref = {ref: records[record_id] for record_id, ref in known_refs.items()}
         labels = {ref: c.name for ref, (c, _) in by_ref.items()} | {ref: r.name for ref, r in record_by_ref.items()}
         for group in group_verdicts(candidates, judgement, kind="character", labels=labels):
-            members = [by_ref[ref][0] for ref in group.members]
+            canonical, embedding = by_ref[group.canonical]
             if group.stored:
-                record = record_by_ref[group.stored]
-                logger.info("Merging %s into %r", [m.name for m in members], record.name)
-                plan.merges.append((record, members))
+                anchor = record_by_ref[group.stored]
+                accepted = [anchor.name, *anchor.aliases]
             else:
-                canonical, embedding = by_ref[group.canonical]
-                others = [m for m in members if m is not canonical]
-                plan.creations.append((canonical, embedding, others))
+                anchor = canonical
+                accepted = [canonical.name, *canonical.aliases]
+            members = []
+            for ref in group.members:
+                member, member_embedding = by_ref[ref]
+                if ref != group.canonical or group.stored:
+                    names = [member.name, *member.aliases]
+                    if names_conflict(names, accepted):
+                        logger.warning(
+                            "character judge: %r and %r have conflicting names; kept apart", member.name, anchor.name
+                        )
+                        plan.creations.append((member, member_embedding, []))
+                        continue
+                    accepted.extend(names)
+                members.append(member)
+            if group.stored:
+                if members:
+                    logger.info("Merging %s into %r", [m.name for m in members], anchor.name)
+                    plan.merges.append((anchor, members))
+            else:
+                plan.creations.append((canonical, embedding, [m for m in members if m is not canonical]))
         return plan
 
     async def apply(self, plan: CharacterPlan, writer: GraphWriter) -> dict[str, CharacterRecord]:
